@@ -1,0 +1,11 @@
+# Binaries
+mayberry
+mayberry.exe
+dist/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Config (may contain local paths)
+.claude/
