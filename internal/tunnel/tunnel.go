@@ -94,8 +94,28 @@ func (c *Client) Connect(ctx context.Context) error {
 	c.conn = conn
 	log.Printf("tunnel: WebSocket connected as %s.branch.pub", c.subdomain)
 
+	go c.pingLoop(ctx)
 	go c.readLoop(ctx, wsURL)
 	return nil
+}
+
+// pingLoop sends WebSocket pings to keep the connection alive through proxies.
+func (c *Client) pingLoop(ctx context.Context) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			c.mu.Lock()
+			err := c.conn.WriteMessage(websocket.PingMessage, nil)
+			c.mu.Unlock()
+			if err != nil {
+				return
+			}
+		}
+	}
 }
 
 // readLoop reads tunnel requests from the WebSocket and forwards them to the local server.
@@ -208,6 +228,7 @@ func (c *Client) reconnectLoop(ctx context.Context, wsURL string) {
 
 		c.conn = conn
 		log.Printf("tunnel: reconnected as %s.branch.pub", c.subdomain)
+		go c.pingLoop(ctx)
 		c.readLoop(ctx, wsURL)
 		return
 	}
