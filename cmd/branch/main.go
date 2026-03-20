@@ -367,6 +367,9 @@ func startFullServices(ctx context.Context, cfg *config.BranchConfig, hubURL str
 		}()
 	}
 
+	// Auto-update check (every hour)
+	go autoUpdateLoop(ctx, alog)
+
 	// Clean up on context cancellation.
 	go func() {
 		<-ctx.Done()
@@ -664,6 +667,118 @@ func printStatus(cfg *config.BranchConfig) {
 	fmt.Printf("    Update:     mayberry update\n")
 	fmt.Printf("    Stop:       mayberry service uninstall\n")
 	fmt.Println()
+}
+
+func autoUpdateLoop(ctx context.Context, alog *activityLog) {
+	if Version == "dev" {
+		return
+	}
+	// Wait a bit before first check so startup isn't slowed.
+	select {
+	case <-ctx.Done():
+		return
+	case <-time.After(5 * time.Minute):
+	}
+
+	ticker := time.NewTicker(1 * time.Hour)
+	defer ticker.Stop()
+
+	for {
+		if performAutoUpdate(alog) {
+			return // updated and restarting
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+func performAutoUpdate(alog *activityLog) bool {
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get(config.DefaultServerURL + "/api/releases/latest")
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+
+	var info struct {
+		Version string `json:"version"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
+		return false
+	}
+	if info.Version == "" || info.Version == "unknown" || info.Version == Version {
+		return false
+	}
+
+	alog.Add(fmt.Sprintf("Auto-updating: %s -> %s", Version, info.Version))
+	log.Printf("auto-update: %s -> %s", Version, info.Version)
+
+	// Download the new binary.
+	ext := ""
+	if runtime.GOOS == "windows" {
+		ext = ".exe"
+	}
+	url := fmt.Sprintf("%s/releases/mayberry-%s-%s%s", config.DefaultServerURL, runtime.GOOS, runtime.GOARCH, ext)
+
+	dlResp, err := client.Get(url)
+	if err != nil || dlResp.StatusCode != 200 {
+		log.Printf("auto-update: download failed")
+		return false
+	}
+	defer dlResp.Body.Close()
+
+	execPath, err := os.Executable()
+	if err != nil {
+		return false
+	}
+	execPath, _ = filepath.EvalSymlinks(execPath)
+
+	tmpPath := execPath + ".update"
+	tmp, err := os.Create(tmpPath)
+	if err != nil {
+		return false
+	}
+
+	if _, err := io.Copy(tmp, dlResp.Body); err != nil {
+		tmp.Close()
+		os.Remove(tmpPath)
+		return false
+	}
+	tmp.Close()
+	os.Chmod(tmpPath, 0755)
+
+	// Swap the binary.
+	if runtime.GOOS == "windows" {
+		oldPath := execPath + ".old"
+		os.Remove(oldPath)
+		os.Rename(execPath, oldPath)
+	}
+	if err := os.Rename(tmpPath, execPath); err != nil {
+		os.Remove(tmpPath)
+		return false
+	}
+
+	alog.Add(fmt.Sprintf("Updated to %s, restarting...", info.Version))
+	log.Printf("auto-update: updated to %s, restarting service", info.Version)
+
+	// Restart the service.
+	switch runtime.GOOS {
+	case "darwin":
+		plist := macPlistPath()
+		if _, err := os.Stat(plist); err == nil {
+			exec.Command("launchctl", "unload", plist).Run()
+			exec.Command("launchctl", "load", plist).Run()
+		}
+	case "linux":
+		upath := linuxUnitPath()
+		if _, err := os.Stat(upath); err == nil {
+			exec.Command("systemctl", "--user", "restart", linuxUnit).Run()
+		}
+	}
+	return true
 }
 
 func checkForUpdate() {

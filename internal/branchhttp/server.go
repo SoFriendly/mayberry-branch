@@ -170,13 +170,26 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.mux.ServeHTTP(w, r)
 }
 
+// localOnly wraps a handler to reject requests arriving via the public tunnel.
+// The tunnel client sets X-Mayberry-Via-Tunnel on forwarded requests; the proxy
+// hub strips this header from external input so it cannot be spoofed.
+func localOnly(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Mayberry-Via-Tunnel") != "" {
+			http.Error(w, "This endpoint is only available on the local network", 403)
+			return
+		}
+		next(w, r)
+	}
+}
+
 func (s *Server) routes() {
 	s.mux.HandleFunc("/", s.handleDashboard)
-	s.mux.HandleFunc("/settings", s.handleSettingsPage)
-	s.mux.HandleFunc("/api/catalog", s.handleCatalog)
-	s.mux.HandleFunc("/api/status", s.handleStatus)
-	s.mux.HandleFunc("/api/setup", s.handleSetup)
-	s.mux.HandleFunc("/api/browse", s.handleBrowse)
+	s.mux.HandleFunc("/settings", localOnly(s.handleSettingsPage))
+	s.mux.HandleFunc("/api/catalog", localOnly(s.handleCatalog))
+	s.mux.HandleFunc("/api/status", localOnly(s.handleStatus))
+	s.mux.HandleFunc("/api/setup", localOnly(s.handleSetup))
+	s.mux.HandleFunc("/api/browse", localOnly(s.handleBrowse))
 	s.mux.HandleFunc("/favicon.ico", s.handleFavicon)
 	s.mux.HandleFunc("/covers/", s.handleLocalCover)
 	s.mux.HandleFunc("/download/", s.handleDownload)
@@ -1051,6 +1064,11 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 	claims, err := auth.VerifyToken(s.publicKey, tokenStr)
 	if err != nil {
 		http.Error(w, "Invalid or expired token", 403)
+		return
+	}
+
+	if claims.Purpose != "download" {
+		http.Error(w, "Invalid token purpose", 403)
 		return
 	}
 

@@ -178,6 +178,10 @@ func (c *Client) forwardToLocal(client *http.Client, localBase string, req *tunn
 		httpReq.Header.Set(k, v)
 	}
 
+	// Mark request as arriving via the public tunnel so the Branch
+	// HTTP server can restrict local-only endpoints.
+	httpReq.Header.Set("X-Mayberry-Via-Tunnel", "true")
+
 	resp, err := client.Do(httpReq)
 	if err != nil {
 		log.Printf("tunnel: local forward error: %v", err)
