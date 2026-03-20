@@ -2,6 +2,8 @@ package branchhttp
 
 import (
 	"crypto/ed25519"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -87,8 +89,17 @@ type BookMeta struct {
 	Categories    []string `json:"categories,omitempty"`
 }
 
+// bookID returns the ISBN if available, otherwise a content hash of title+author.
+func bookID(isbn, title, author string) string {
+	if isbn != "" {
+		return isbn
+	}
+	h := sha256.Sum256([]byte(strings.ToLower(title + "\x00" + author)))
+	return "MB" + hex.EncodeToString(h[:6]) // e.g. "MB1a2b3c4d5e6f"
+}
+
 // UpdateCatalog replaces the current catalog with newly scanned epub files.
-// Returns metadata for all books with ISBNs (for sync to Town Square).
+// Returns metadata for all books (for sync to Town Square).
 func (s *Server) UpdateCatalog(epubPaths []string) []BookMeta {
 	var entries []CatalogEntry
 	holdings := make(map[string]string)
@@ -125,6 +136,7 @@ func (s *Server) UpdateCatalog(epubPaths []string) []BookMeta {
 			}
 		}
 
+		id := bookID(meta.ISBN, meta.Title, meta.Author)
 		entry := CatalogEntry{
 			Path:     p,
 			Title:    meta.Title,
@@ -133,10 +145,10 @@ func (s *Server) UpdateCatalog(epubPaths []string) []BookMeta {
 			HasCover: hasCover,
 		}
 		entries = append(entries, entry)
-		if meta.ISBN != "" {
-			holdings[meta.ISBN] = p
+		if meta.Title != "" {
+			holdings[id] = p
 			books = append(books, BookMeta{
-				ISBN:          meta.ISBN,
+				ISBN:          id,
 				Title:         meta.Title,
 				Author:        meta.Author,
 				PublishedDate: meta.PublishedDate,
