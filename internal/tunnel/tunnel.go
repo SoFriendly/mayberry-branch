@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"net/url"
@@ -28,10 +27,15 @@ type tunnelRequest struct {
 // tunnelResponse is sent back to the hub over the WebSocket.
 type tunnelResponse struct {
 	ID      string            `json:"id"`
-	Status  int               `json:"status"`
-	Headers map[string]string `json:"headers"`
-	Body    string            `json:"body"` // base64-encoded
+	Status  int               `json:"status,omitempty"`
+	Headers map[string]string `json:"headers,omitempty"`
+	Body    string            `json:"body,omitempty"`    // base64 (legacy)
+	Chunked bool              `json:"chunked,omitempty"` // streaming mode
+	Chunk   string            `json:"chunk,omitempty"`   // base64 chunk
+	Done    bool              `json:"done,omitempty"`    // end of stream
 }
+
+const chunkSize = 256 * 1024 // 256KB chunks
 
 // TokenRefreshFunc is called to get a fresh tunnel token when reconnecting.
 type TokenRefreshFunc func() string
@@ -153,64 +157,77 @@ func (c *Client) readLoop(ctx context.Context, wsURL string) {
 		}
 
 		// Forward the request to the local Branch HTTP server.
-		go func(req tunnelRequest) {
-			resp := c.forwardToLocal(localClient, localBase, &req)
-			c.mu.Lock()
-			writeErr := c.conn.WriteJSON(resp)
-			c.mu.Unlock()
-			if writeErr != nil {
-				log.Printf("tunnel: WebSocket write error: %v", writeErr)
-			}
-		}(req)
+		go c.forwardToLocal(localClient, localBase, req)
 	}
 }
 
-// forwardToLocal sends a tunneled request to the local Branch HTTP server.
-func (c *Client) forwardToLocal(client *http.Client, localBase string, req *tunnelRequest) *tunnelResponse {
+func (c *Client) writeResponse(resp *tunnelResponse) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.conn.WriteJSON(resp)
+}
+
+// forwardToLocal sends a tunneled request to the local Branch HTTP server
+// and streams the response back through the WebSocket in chunks.
+func (c *Client) forwardToLocal(client *http.Client, localBase string, req tunnelRequest) {
 	bodyBytes, err := base64.StdEncoding.DecodeString(req.Body)
 	if err != nil {
-		log.Printf("tunnel: bad base64 body for %s: %v", req.ID, err)
-		return &tunnelResponse{ID: req.ID, Status: 400, Headers: map[string]string{}, Body: ""}
+		c.writeResponse(&tunnelResponse{ID: req.ID, Status: 400})
+		return
 	}
-	localURL := localBase + req.Path
 
-	httpReq, err := http.NewRequest(req.Method, localURL, bytes.NewReader(bodyBytes))
+	httpReq, err := http.NewRequest(req.Method, localBase+req.Path, bytes.NewReader(bodyBytes))
 	if err != nil {
-		return &tunnelResponse{ID: req.ID, Status: 502, Headers: map[string]string{}, Body: ""}
+		c.writeResponse(&tunnelResponse{ID: req.ID, Status: 502})
+		return
 	}
 
 	for k, v := range req.Headers {
 		httpReq.Header.Set(k, v)
 	}
-
-	// Mark request as arriving via the public tunnel so the Branch
-	// HTTP server can restrict local-only endpoints.
 	httpReq.Header.Set("X-Mayberry-Via-Tunnel", "true")
 
 	resp, err := client.Do(httpReq)
 	if err != nil {
-		log.Printf("tunnel: local forward error: %v", err)
-		return &tunnelResponse{ID: req.ID, Status: 502, Headers: map[string]string{}, Body: ""}
+		c.writeResponse(&tunnelResponse{ID: req.ID, Status: 502})
+		return
 	}
 	defer resp.Body.Close()
-
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		log.Printf("tunnel: read local response: %v", err)
-		return &tunnelResponse{ID: req.ID, Status: 502, Headers: map[string]string{}, Body: ""}
-	}
 
 	headers := make(map[string]string)
 	for k, vals := range resp.Header {
 		headers[k] = strings.Join(vals, ", ")
 	}
 
-	return &tunnelResponse{
+	// Send headers first.
+	if err := c.writeResponse(&tunnelResponse{
 		ID:      req.ID,
 		Status:  resp.StatusCode,
 		Headers: headers,
-		Body:    base64.StdEncoding.EncodeToString(respBody),
+		Chunked: true,
+	}); err != nil {
+		return
 	}
+
+	// Stream body in chunks.
+	buf := make([]byte, chunkSize)
+	for {
+		n, readErr := resp.Body.Read(buf)
+		if n > 0 {
+			if err := c.writeResponse(&tunnelResponse{
+				ID:    req.ID,
+				Chunk: base64.StdEncoding.EncodeToString(buf[:n]),
+			}); err != nil {
+				return
+			}
+		}
+		if readErr != nil {
+			break
+		}
+	}
+
+	// Signal end of stream.
+	c.writeResponse(&tunnelResponse{ID: req.ID, Done: true})
 }
 
 // reconnectLoop attempts to re-establish the WebSocket connection with backoff.
