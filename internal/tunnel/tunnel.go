@@ -132,7 +132,7 @@ func (c *Client) readLoop(ctx context.Context, wsURL string) {
 	}()
 
 	localBase := fmt.Sprintf("http://localhost:%d", c.localPort)
-	localClient := &http.Client{Timeout: 30 * time.Second}
+	localClient := &http.Client{Timeout: 120 * time.Second}
 
 	for {
 		select {
