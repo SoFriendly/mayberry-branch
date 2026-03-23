@@ -347,7 +347,9 @@ func startFullServices(ctx context.Context, cfg *config.BranchConfig, hubURL str
 			alog.Add("Warning: no tunnel token — hub may reject connection")
 		}
 	}
-	tun := tunnel.NewClient(cfg.Subdomain, cfg.Port, hubURL, tunnelToken)
+	tun := tunnel.NewClient(cfg.Subdomain, cfg.Port, hubURL, tunnelToken, func() string {
+		return fetchTunnelToken(cfg.ServerURL, branchID, cfg.Subdomain)
+	})
 	go func() {
 		alog.Add(fmt.Sprintf("Connecting tunnel %s.branch.pub...", cfg.Subdomain))
 		if err := tun.Connect(ctx); err != nil {

@@ -33,25 +33,30 @@ type tunnelResponse struct {
 	Body    string            `json:"body"` // base64-encoded
 }
 
+// TokenRefreshFunc is called to get a fresh tunnel token when reconnecting.
+type TokenRefreshFunc func() string
+
 // Client manages a WebSocket reverse tunnel connection to the Proxy Hub.
 type Client struct {
-	subdomain  string
-	localPort  int
-	hubURL     string
-	token      string
-	conn       *websocket.Conn
-	mu         sync.Mutex // protects conn writes
-	cancelFunc context.CancelFunc
+	subdomain    string
+	localPort    int
+	hubURL       string
+	token        string
+	refreshToken TokenRefreshFunc
+	conn         *websocket.Conn
+	mu           sync.Mutex // protects conn writes
+	cancelFunc   context.CancelFunc
 }
 
 // NewClient creates a tunnel client that will connect the local Branch
 // server to the branch.pub proxy hub via WebSocket.
-func NewClient(subdomain string, localPort int, hubURL, token string) *Client {
+func NewClient(subdomain string, localPort int, hubURL, token string, refresh TokenRefreshFunc) *Client {
 	return &Client{
-		subdomain: subdomain,
-		localPort: localPort,
-		hubURL:    hubURL,
-		token:     token,
+		subdomain:    subdomain,
+		localPort:    localPort,
+		hubURL:       hubURL,
+		token:        token,
+		refreshToken: refresh,
 	}
 }
 
@@ -218,6 +223,14 @@ func (c *Client) reconnectLoop(ctx context.Context, wsURL string) {
 		case <-ctx.Done():
 			return
 		case <-time.After(backoff):
+		}
+
+		// Refresh the tunnel token before reconnecting (it may have expired).
+		if c.refreshToken != nil {
+			if newToken := c.refreshToken(); newToken != "" {
+				c.token = newToken
+				wsURL = c.buildWSURL()
+			}
 		}
 
 		log.Printf("tunnel: reconnecting...")
