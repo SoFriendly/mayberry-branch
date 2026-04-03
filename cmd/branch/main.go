@@ -675,14 +675,14 @@ func autoUpdateLoop(ctx context.Context, alog *activityLog) {
 	if Version == "dev" {
 		return
 	}
-	// Wait a bit before first check so startup isn't slowed.
+	// Short delay before first check, then every 15 minutes.
 	select {
 	case <-ctx.Done():
 		return
-	case <-time.After(5 * time.Minute):
+	case <-time.After(1 * time.Minute):
 	}
 
-	ticker := time.NewTicker(1 * time.Hour)
+	ticker := time.NewTicker(15 * time.Minute)
 	defer ticker.Stop()
 
 	for {
@@ -698,8 +698,8 @@ func autoUpdateLoop(ctx context.Context, alog *activityLog) {
 }
 
 func performAutoUpdate(alog *activityLog) bool {
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Get(config.DefaultServerURL + "/api/releases/latest")
+	checkClient := &http.Client{Timeout: 10 * time.Second}
+	resp, err := checkClient.Get(config.DefaultServerURL + "/api/releases/latest")
 	if err != nil {
 		return false
 	}
@@ -718,16 +718,21 @@ func performAutoUpdate(alog *activityLog) bool {
 	alog.Add(fmt.Sprintf("Auto-updating: %s -> %s", Version, info.Version))
 	log.Printf("auto-update: %s -> %s", Version, info.Version)
 
-	// Download the new binary.
 	ext := ""
 	if runtime.GOOS == "windows" {
 		ext = ".exe"
 	}
 	url := fmt.Sprintf("%s/releases/mayberry-%s-%s%s", config.DefaultServerURL, runtime.GOOS, runtime.GOARCH, ext)
 
-	dlResp, err := client.Get(url)
-	if err != nil || dlResp.StatusCode != 200 {
-		log.Printf("auto-update: download failed")
+	dlClient := &http.Client{Timeout: 5 * time.Minute}
+	dlResp, err := dlClient.Get(url)
+	if err != nil {
+		log.Printf("auto-update: download failed: %v", err)
+		return false
+	}
+	if dlResp.StatusCode != 200 {
+		dlResp.Body.Close()
+		log.Printf("auto-update: download returned %d", dlResp.StatusCode)
 		return false
 	}
 	defer dlResp.Body.Close()

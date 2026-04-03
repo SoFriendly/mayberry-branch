@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 
@@ -791,6 +792,17 @@ func (s *Server) handleBrowse(w http.ResponseWriter, r *http.Request) {
 	parent := filepath.Dir(dir)
 	if parent != dir {
 		dirs = append(dirs, dirEntry{Name: "..", Path: parent, IsDir: true})
+	} else if runtime.GOOS == "windows" {
+		// At a drive root — show all available drives so users can switch partitions.
+		for _, letter := range "ABCDEFGHIJKLMNOPQRSTUVWXYZ" {
+			drive := string(letter) + ":\\"
+			if drive == dir {
+				continue // skip current drive
+			}
+			if _, err := os.Stat(drive); err == nil {
+				dirs = append(dirs, dirEntry{Name: drive, Path: drive, IsDir: true})
+			}
+		}
 	}
 	for _, e := range entries {
 		// Skip hidden files/dirs.
