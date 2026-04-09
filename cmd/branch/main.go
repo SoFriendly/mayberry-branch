@@ -328,9 +328,9 @@ func startFullServices(ctx context.Context, cfg *config.BranchConfig, hubURL str
 		state.setBookCount(len(epubs), len(books))
 		state.setStatus("watcher", "watching")
 		alog.Add(fmt.Sprintf("Scanned %d book(s), %d with ISBN", len(epubs), len(books)))
-		if branchID != "" && len(books) > 0 {
+		if branchID != "" {
 			syncBooks(cfg.ServerURL, branchID, books)
-			alog.Add(fmt.Sprintf("Synced %d ISBN(s) to Town Square", len(books)))
+			alog.Add(fmt.Sprintf("Synced %d book(s) to Town Square", len(books)))
 		}
 	})
 	watcher.Start()
