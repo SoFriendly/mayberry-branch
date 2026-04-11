@@ -89,10 +89,7 @@ func (c *Client) Connect(ctx context.Context) error {
 	wsURL := c.buildWSURL()
 	log.Printf("tunnel: connecting WebSocket to hub")
 
-	dialer := websocket.Dialer{
-		HandshakeTimeout: 10 * time.Second,
-	}
-
+	dialer := websocket.Dialer{HandshakeTimeout: 10 * time.Second}
 	conn, _, err := dialer.DialContext(ctx, wsURL, nil)
 	if err != nil {
 		log.Printf("tunnel: connecting (will retry in background)")
@@ -103,8 +100,13 @@ func (c *Client) Connect(ctx context.Context) error {
 	c.conn = conn
 	log.Printf("tunnel: WebSocket connected as %s.branch.pub", c.subdomain)
 
-	go c.pingLoop(ctx)
-	go c.readLoop(ctx, wsURL)
+	// Run readLoop in a goroutine, then reconnectLoop takes over on disconnect.
+	go func() {
+		go c.pingLoop(ctx)
+		c.readLoop(ctx, wsURL)
+		// Connection dropped — enter reconnect loop.
+		c.reconnectLoop(ctx, wsURL)
+	}()
 	return nil
 }
 
@@ -151,9 +153,7 @@ func (c *Client) readLoop(ctx context.Context, wsURL string) {
 				return
 			}
 			log.Printf("tunnel: connection lost, reconnecting...")
-			// Connection lost — attempt reconnect (blocks until success or ctx cancel).
-			c.reconnectLoop(ctx, wsURL)
-			return
+			return // exit readLoop, reconnectLoop will handle retry
 		}
 
 		// Forward the request to the local Branch HTTP server.
@@ -231,6 +231,7 @@ func (c *Client) forwardToLocal(client *http.Client, localBase string, req tunne
 }
 
 // reconnectLoop attempts to re-establish the WebSocket connection with backoff.
+// It runs forever (until ctx is cancelled), reconnecting whenever the connection drops.
 func (c *Client) reconnectLoop(ctx context.Context, wsURL string) {
 	dialer := websocket.Dialer{HandshakeTimeout: 10 * time.Second}
 	backoff := 2 * time.Second
@@ -253,18 +254,28 @@ func (c *Client) reconnectLoop(ctx context.Context, wsURL string) {
 		log.Printf("tunnel: reconnecting...")
 		conn, _, err := dialer.DialContext(ctx, wsURL, nil)
 		if err != nil {
-			log.Printf("tunnel: reconnect retry in %s", backoff*2)
 			if backoff < 60*time.Second {
 				backoff *= 2
 			}
+			log.Printf("tunnel: reconnect retry in %s", backoff)
 			continue
 		}
 
 		c.conn = conn
 		log.Printf("tunnel: reconnected as %s.branch.pub", c.subdomain)
+
+		connectedAt := time.Now()
 		go c.pingLoop(ctx)
 		c.readLoop(ctx, wsURL)
-		return
+
+		// readLoop exited — connection dropped.
+		// Only reset backoff if connection lasted more than 30 seconds.
+		// This prevents rapid-fire reconnect storms.
+		if time.Since(connectedAt) > 30*time.Second {
+			backoff = 2 * time.Second
+		} else if backoff < 60*time.Second {
+			backoff *= 2
+		}
 	}
 }
 
