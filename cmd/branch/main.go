@@ -771,20 +771,10 @@ func performAutoUpdate(alog *activityLog) bool {
 	alog.Add(fmt.Sprintf("Updated to %s, restarting...", info.Version))
 	log.Printf("auto-update: updated to %s, restarting service", info.Version)
 
-	// Restart the service.
-	switch runtime.GOOS {
-	case "darwin":
-		plist := macPlistPath()
-		if _, err := os.Stat(plist); err == nil {
-			exec.Command("launchctl", "unload", plist).Run()
-			exec.Command("launchctl", "load", plist).Run()
-		}
-	case "linux":
-		upath := linuxUnitPath()
-		if _, err := os.Stat(upath); err == nil {
-			exec.Command("systemctl", "--user", "restart", linuxUnit).Run()
-		}
-	}
+	// Restart: just exit. LaunchAgent has KeepAlive=true and systemd has
+	// Restart=on-failure, so the OS will restart us with the new binary.
+	log.Printf("auto-update: exiting for restart")
+	os.Exit(0)
 	return true
 }
 
