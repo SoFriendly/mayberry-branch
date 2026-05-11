@@ -77,6 +77,11 @@ func (s *Server) SetSetupCallback(cb SetupCallback) {
 }
 
 // SetPublicKey sets the Town Square public key for JWT verification.
+// CoverDir returns the directory where extracted cover images are cached.
+func (s *Server) CoverDir() string {
+	return s.coverDir
+}
+
 func (s *Server) SetPublicKey(pk ed25519.PublicKey) {
 	s.publicKey = pk
 }

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"encoding/base64"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -329,7 +330,7 @@ func startFullServices(ctx context.Context, cfg *config.BranchConfig, hubURL str
 		state.setStatus("watcher", "watching")
 		alog.Add(fmt.Sprintf("Scanned %d book(s), %d with ISBN", len(epubs), len(books)))
 		if branchID != "" {
-			syncBooks(cfg.ServerURL, branchID, books)
+			syncBooks(cfg.ServerURL, branchID, branchSrv.CoverDir(), books)
 			alog.Add(fmt.Sprintf("Synced %d book(s) to Town Square", len(books)))
 		}
 	})
@@ -443,7 +444,7 @@ func fetchTunnelToken(serverURL, branchID, subdomain string) string {
 	return result.Token
 }
 
-func syncBooks(serverURL, branchID string, books []branchhttp.BookMeta) {
+func syncBooks(serverURL, branchID, coverDir string, books []branchhttp.BookMeta) {
 	body, err := json.Marshal(map[string]any{
 		"branch_id": branchID,
 		"books":     books,
@@ -457,7 +458,60 @@ func syncBooks(serverURL, branchID string, books []branchhttp.BookMeta) {
 		log.Printf("branch: sync: %v", err)
 		return
 	}
+	defer resp.Body.Close()
+
+	var result struct {
+		Status      string   `json:"status"`
+		NeedsCovers []string `json:"needs_covers"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return
+	}
+	if coverDir == "" || len(result.NeedsCovers) == 0 {
+		return
+	}
+	uploaded := 0
+	for _, isbn := range result.NeedsCovers {
+		if uploadCover(serverURL, branchID, coverDir, isbn) {
+			uploaded++
+		}
+	}
+	if uploaded > 0 {
+		log.Printf("branch: uploaded %d cover(s) to Town Square", uploaded)
+	}
+}
+
+// uploadCover sends a single cover image to Town Square. Returns true on
+// successful upload (or if no local file exists, which is silent).
+func uploadCover(serverURL, branchID, coverDir, isbn string) bool {
+	ext := ".jpg"
+	path := filepath.Join(coverDir, isbn+ext)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		// Try PNG fallback.
+		ext = ".png"
+		path = filepath.Join(coverDir, isbn+ext)
+		data, err = os.ReadFile(path)
+		if err != nil {
+			return false
+		}
+	}
+	body, err := json.Marshal(map[string]any{
+		"branch_id": branchID,
+		"isbn":      isbn,
+		"cover_b64": base64.StdEncoding.EncodeToString(data),
+		"ext":       ext,
+	})
+	if err != nil {
+		return false
+	}
+	resp, err := httpClient.Post(serverURL+"/api/branches/cover", "application/json", bytes.NewReader(body))
+	if err != nil {
+		log.Printf("branch: cover upload %s: %v", isbn, err)
+		return false
+	}
 	resp.Body.Close()
+	return resp.StatusCode == http.StatusOK
 }
 
 const heartbeatInterval = 5 * time.Minute
