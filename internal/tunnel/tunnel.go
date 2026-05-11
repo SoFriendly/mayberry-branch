@@ -138,7 +138,9 @@ func (c *Client) readLoop(ctx context.Context, wsURL string) {
 	}()
 
 	localBase := fmt.Sprintf("http://localhost:%d", c.localPort)
-	localClient := &http.Client{Timeout: 120 * time.Second}
+	// No timeout: large downloads to slow clients can take many minutes,
+	// and TCP backpressure blocks the local body read.
+	localClient := &http.Client{}
 
 	for {
 		select {

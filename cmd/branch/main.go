@@ -771,9 +771,31 @@ func performAutoUpdate(alog *activityLog) bool {
 	alog.Add(fmt.Sprintf("Updated to %s, restarting...", info.Version))
 	log.Printf("auto-update: updated to %s, restarting service", info.Version)
 
-	// Restart: just exit. LaunchAgent has KeepAlive=true and systemd has
-	// Restart=on-failure, so the OS will restart us with the new binary.
-	log.Printf("auto-update: exiting for restart")
+	// Windows: no service manager, just keep running — new version takes effect on next launch.
+	if runtime.GOOS == "windows" {
+		log.Printf("auto-update: updated to %s — restart mayberry to use new version", info.Version)
+		return false
+	}
+
+	// macOS/Linux: schedule a detached restart that outlives this process.
+	// Using `sh -c` with background &: spawns a new process group that waits
+	// briefly then restarts the service. This works even if launchd's KeepAlive
+	// rate-limits us, because the shell command is independent.
+	log.Printf("auto-update: scheduling restart")
+	switch runtime.GOOS {
+	case "darwin":
+		plist := macPlistPath()
+		script := fmt.Sprintf("sleep 2 && launchctl kickstart -k gui/$(id -u)/%s", macLabel)
+		if _, err := os.Stat(plist); err == nil {
+			exec.Command("sh", "-c", script).Start()
+		}
+	case "linux":
+		script := fmt.Sprintf("sleep 2 && systemctl --user restart %s", linuxUnit)
+		exec.Command("sh", "-c", script).Start()
+	}
+
+	// Give the scheduled restart time to fire, then exit.
+	time.Sleep(1 * time.Second)
 	os.Exit(0)
 	return true
 }
