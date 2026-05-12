@@ -46,6 +46,7 @@ type CatalogEntry struct {
 	Title    string `json:"title"`
 	Author   string `json:"author"`
 	ISBN     string `json:"isbn"`
+	ID       string `json:"id"` // bookID — ISBN or MB+hash
 	HasCover bool   `json:"has_cover"`
 }
 
@@ -125,29 +126,26 @@ func (s *Server) UpdateCatalog(epubPaths []string) []BookMeta {
 			continue
 		}
 
+		id := bookID(meta.ISBN, meta.Title, meta.Author)
+
 		hasCover := false
 		if len(meta.CoverData) > 0 {
-			// Cache cover to disk. Use ISBN if available, otherwise hash the path.
-			coverName := meta.ISBN
-			if coverName == "" {
-				coverName = filepath.Base(p)
-			}
 			ext := ".jpg"
 			if strings.Contains(meta.CoverType, "png") {
 				ext = ".png"
 			}
-			coverPath := filepath.Join(s.coverDir, coverName+ext)
+			coverPath := filepath.Join(s.coverDir, id+ext)
 			if err := os.WriteFile(coverPath, meta.CoverData, 0644); err == nil {
 				hasCover = true
 			}
 		}
 
-		id := bookID(meta.ISBN, meta.Title, meta.Author)
 		entry := CatalogEntry{
 			Path:     p,
 			Title:    meta.Title,
 			Author:   meta.Author,
 			ISBN:     meta.ISBN,
+			ID:       id,
 			HasCover: hasCover,
 		}
 		entries = append(entries, entry)
@@ -678,7 +676,7 @@ fetch('/api/catalog').then(r=>r.json()).then(books=>{
     const li=document.createElement('li');
     li.className='book-item';
     const isbn=b.isbn?'<span class="isbn-badge">'+b.isbn+'</span>':'';
-    var coverKey=b.isbn||encodeURIComponent(b.path.split('/').pop());
+    var coverKey=b.id||b.isbn||encodeURIComponent(b.path.split('/').pop());
     var img=b.has_cover?'<img src="/covers/'+coverKey+'" class="book-cover" onerror="this.style.display=\'none\';this.nextSibling.style.display=\'flex\'"><div class="book-icon" style="display:none">📕</div>':'<div class="book-icon">📕</div>';
     li.innerHTML=img+'<div class="book-info"><div class="book-title">'+(b.title||'Unknown Title')+'</div><div class="book-meta">by '+(b.author||'Unknown')+'</div></div>'+isbn;
     ul.appendChild(li);
