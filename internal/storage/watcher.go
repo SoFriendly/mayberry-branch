@@ -4,26 +4,38 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"strings"
+	"sort"
 	"sync"
 	"time"
 )
 
-// Watcher monitors a directory for .epub file changes at a regular interval.
+// Watcher monitors one or more directories for supported book file changes
+// at a regular interval (.epub and .m4b, by IsSupportedFile).
 type Watcher struct {
-	dir      string
+	dirs     []string
 	interval time.Duration
-	onChange func(epubs []string)
+	onChange func(paths []string)
 	stop     chan struct{}
 	known    map[string]time.Time
 	mu       sync.Mutex
 }
 
-// NewWatcher creates a directory watcher that calls onChange when the set of
-// .epub files changes. It polls at the given interval.
+// NewWatcher creates a watcher for a single directory.
 func NewWatcher(dir string, interval time.Duration, onChange func([]string)) *Watcher {
+	return NewMultiWatcher([]string{dir}, interval, onChange)
+}
+
+// NewMultiWatcher creates a watcher that scans several directories. Empty
+// strings are skipped, so callers can pass conditionally-set paths directly.
+func NewMultiWatcher(dirs []string, interval time.Duration, onChange func([]string)) *Watcher {
+	clean := make([]string, 0, len(dirs))
+	for _, d := range dirs {
+		if d != "" {
+			clean = append(clean, d)
+		}
+	}
 	return &Watcher{
-		dir:      dir,
+		dirs:     clean,
 		interval: interval,
 		onChange: onChange,
 		stop:     make(chan struct{}),
@@ -42,7 +54,6 @@ func (w *Watcher) Stop() {
 }
 
 func (w *Watcher) loop() {
-	// Initial scan
 	w.scan()
 
 	ticker := time.NewTicker(w.interval)
@@ -60,18 +71,16 @@ func (w *Watcher) loop() {
 
 func (w *Watcher) scan() {
 	current := make(map[string]time.Time)
-	err := filepath.Walk(w.dir, func(p string, info os.FileInfo, err error) error {
-		if err != nil {
-			return nil // skip inaccessible paths
-		}
-		if !info.IsDir() && strings.EqualFold(filepath.Ext(p), ".epub") {
-			current[p] = info.ModTime()
-		}
-		return nil
-	})
-	if err != nil {
-		log.Printf("watcher: scan error: %v", err)
-		return
+	for _, dir := range w.dirs {
+		filepath.Walk(dir, func(p string, info os.FileInfo, err error) error {
+			if err != nil || info == nil {
+				return nil // skip inaccessible paths
+			}
+			if !info.IsDir() && IsSupportedFile(p) {
+				current[p] = info.ModTime()
+			}
+			return nil
+		})
 	}
 
 	w.mu.Lock()
@@ -85,18 +94,19 @@ func (w *Watcher) scan() {
 		}
 	}
 
-	var epubs []string
+	var paths []string
 	if changed {
 		w.known = current
-		epubs = make([]string, 0, len(current))
+		paths = make([]string, 0, len(current))
 		for p := range current {
-			epubs = append(epubs, p)
+			paths = append(paths, p)
 		}
+		sort.Strings(paths)
 	}
 	w.mu.Unlock()
 
 	if changed {
-		log.Printf("watcher: detected %d epub(s) in %s", len(epubs), w.dir)
-		w.onChange(epubs)
+		log.Printf("watcher: detected %d file(s) across %d dir(s)", len(paths), len(w.dirs))
+		w.onChange(paths)
 	}
 }

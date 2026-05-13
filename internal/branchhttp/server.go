@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/sofriendly/mayberry/internal/audiobook"
 	"github.com/sofriendly/mayberry/internal/auth"
 	"github.com/sofriendly/mayberry/internal/config"
 	"github.com/sofriendly/mayberry/internal/epub"
@@ -23,6 +24,15 @@ import (
 // SetupCallback is called after the user completes the web setup wizard.
 // It receives the updated config so the caller can trigger a rescan.
 type SetupCallback func(cfg *config.BranchConfig)
+
+// RestartCallback is called when the user clicks the "Restart" button after
+// changing settings. The host process is expected to schedule a daemon restart
+// and exit promptly.
+type RestartCallback func()
+
+// SyncCallback is called when the user (via dashboard or `mayberry sync`)
+// requests an immediate scan + Town Square sync, bypassing the watcher poll.
+type SyncCallback func()
 
 // Server is the Branch local HTTP server providing the dashboard and download endpoint.
 type Server struct {
@@ -36,8 +46,10 @@ type Server struct {
 	catalog  []CatalogEntry // current epub catalog
 	holdings map[string]string // isbn -> filepath
 
-	cfg           *config.BranchConfig
-	onSetup       SetupCallback
+	cfg       *config.BranchConfig
+	onSetup   SetupCallback
+	onRestart RestartCallback
+	onSync    SyncCallback
 }
 
 // CatalogEntry is a scanned epub with its metadata and path.
@@ -77,6 +89,18 @@ func (s *Server) SetSetupCallback(cb SetupCallback) {
 	s.onSetup = cb
 }
 
+// SetRestartCallback sets the function called when the user requests a
+// daemon restart from the settings UI.
+func (s *Server) SetRestartCallback(cb RestartCallback) {
+	s.onRestart = cb
+}
+
+// SetSyncCallback sets the function called when the user requests an
+// immediate library scan + Town Square sync.
+func (s *Server) SetSyncCallback(cb SyncCallback) {
+	s.onSync = cb
+}
+
 // SetPublicKey sets the Town Square public key for JWT verification.
 // CoverDir returns the directory where extracted cover images are cached.
 func (s *Server) CoverDir() string {
@@ -89,74 +113,152 @@ func (s *Server) SetPublicKey(pk ed25519.PublicKey) {
 
 // BookMeta contains ISBN and EPUB-extracted metadata for sync.
 type BookMeta struct {
-	ISBN          string   `json:"isbn"`
-	Title         string   `json:"title,omitempty"`
-	Author        string   `json:"author,omitempty"`
-	PublishedDate string   `json:"published_date,omitempty"`
-	Categories    []string `json:"categories,omitempty"`
+	ISBN            string   `json:"isbn"`
+	Title           string   `json:"title,omitempty"`
+	Author          string   `json:"author,omitempty"`
+	PublishedDate   string   `json:"published_date,omitempty"`
+	Categories      []string `json:"categories,omitempty"`
+	MediaType       string   `json:"media_type,omitempty"`       // "ebook" or "audiobook"
+	Narrator        string   `json:"narrator,omitempty"`         // audiobook only
+	DurationSeconds int      `json:"duration_seconds,omitempty"` // audiobook only
+	FileExt         string   `json:"file_ext,omitempty"`         // ".epub", ".m4b"
+	ASIN            string   `json:"asin,omitempty"`             // audiobook only
 }
 
-// bookID returns the ISBN if available, otherwise a content hash of title+author.
-func bookID(isbn, title, author string) string {
+func isAllDigits(s string) bool {
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return s != ""
+}
+
+// bookID returns the ISBN if available, otherwise a content hash of
+// title+author (plus media type for audiobooks). Ebook IDs are unchanged for
+// backward compatibility — only audiobook IDs get the extra suffix so that a
+// user owning the same title as both .epub and .m4b produces two distinct
+// catalog rows instead of colliding under one ebook record.
+func bookID(isbn, title, author, mediaType string) string {
 	if isbn != "" {
 		return isbn
 	}
-	h := sha256.Sum256([]byte(strings.ToLower(title + "\x00" + author)))
+	payload := strings.ToLower(title + "\x00" + author)
+	if mediaType == "audiobook" {
+		payload += "\x00audiobook"
+	}
+	h := sha256.Sum256([]byte(payload))
 	return "MB" + hex.EncodeToString(h[:6]) // e.g. "MB1a2b3c4d5e6f"
 }
 
-// UpdateCatalog replaces the current catalog with newly scanned epub files.
-// Returns metadata for all books (for sync to Town Square).
-func (s *Server) UpdateCatalog(epubPaths []string) []BookMeta {
+// UpdateCatalog replaces the current catalog with newly scanned book files.
+// Both .epub (ebook) and .m4b (audiobook) paths are accepted. Returns metadata
+// for all titles (for sync to Town Square).
+func (s *Server) UpdateCatalog(bookPaths []string) []BookMeta {
 	var entries []CatalogEntry
 	holdings := make(map[string]string)
 	var books []BookMeta
+	audiobookCount := 0
 
-	for _, p := range epubPaths {
-		meta, err := func() (m epub.Metadata, err error) {
-			defer func() {
-				if r := recover(); r != nil {
-					err = fmt.Errorf("panic: %v", r)
-				}
+	for _, p := range bookPaths {
+		ext := strings.ToLower(filepath.Ext(p))
+		var (
+			title, author, isbn, pubDate, coverType string
+			categories                              []string
+			coverData                               []byte
+			narrator, asin                          string
+			durationSecs                            int
+			mediaType                               = "ebook"
+		)
+
+		switch ext {
+		case ".epub":
+			meta, err := func() (m epub.Metadata, err error) {
+				defer func() {
+					if r := recover(); r != nil {
+						err = fmt.Errorf("panic: %v", r)
+					}
+				}()
+				return epub.ExtractMetadata(p)
 			}()
-			return epub.ExtractMetadata(p)
-		}()
-		if err != nil {
-			log.Printf("branch: skipping %s: %v", filepath.Base(p), err)
+			if err != nil {
+				log.Printf("branch: skipping %s: %v", filepath.Base(p), err)
+				continue
+			}
+			title, author, isbn, pubDate = meta.Title, meta.Author, meta.ISBN, meta.PublishedDate
+			categories = meta.Subjects
+			coverData, coverType = meta.CoverData, meta.CoverType
+		case ".m4b":
+			meta, err := func() (m audiobook.Metadata, err error) {
+				defer func() {
+					if r := recover(); r != nil {
+						err = fmt.Errorf("panic: %v", r)
+					}
+				}()
+				return audiobook.ExtractMetadata(p)
+			}()
+			if err != nil {
+				log.Printf("branch: skipping %s: %v", filepath.Base(p), err)
+				continue
+			}
+			title, author = meta.Title, meta.Author
+			if title == "" {
+				title = strings.TrimSuffix(filepath.Base(p), filepath.Ext(p))
+			}
+			narrator = meta.Narrator
+			pubDate = meta.Year
+			categories = meta.Genres
+			coverData, coverType = meta.CoverData, meta.CoverType
+			durationSecs = meta.DurationSeconds
+			asin = meta.ASIN
+			mediaType = "audiobook"
+			// iTunes ©day is usually a bare year ("2025"); PostgreSQL's ::date
+			// cast on Town Square rejects that. Expand to YYYY-01-01 so the
+			// sync upsert succeeds.
+			if len(pubDate) == 4 && isAllDigits(pubDate) {
+				pubDate = pubDate + "-01-01"
+			}
+			audiobookCount++
+		default:
 			continue
 		}
 
-		id := bookID(meta.ISBN, meta.Title, meta.Author)
+		id := bookID(isbn, title, author, mediaType)
 
 		hasCover := false
-		if len(meta.CoverData) > 0 {
-			ext := ".jpg"
-			if strings.Contains(meta.CoverType, "png") {
-				ext = ".png"
+		if len(coverData) > 0 {
+			coverExt := ".jpg"
+			if strings.Contains(coverType, "png") {
+				coverExt = ".png"
 			}
-			coverPath := filepath.Join(s.coverDir, id+ext)
-			if err := os.WriteFile(coverPath, meta.CoverData, 0644); err == nil {
+			coverPath := filepath.Join(s.coverDir, id+coverExt)
+			if err := os.WriteFile(coverPath, coverData, 0644); err == nil {
 				hasCover = true
 			}
 		}
 
 		entry := CatalogEntry{
 			Path:     p,
-			Title:    meta.Title,
-			Author:   meta.Author,
-			ISBN:     meta.ISBN,
+			Title:    title,
+			Author:   author,
+			ISBN:     isbn,
 			ID:       id,
 			HasCover: hasCover,
 		}
 		entries = append(entries, entry)
-		if meta.Title != "" {
+		if title != "" {
 			holdings[id] = p
 			books = append(books, BookMeta{
-				ISBN:          id,
-				Title:         meta.Title,
-				Author:        meta.Author,
-				PublishedDate: meta.PublishedDate,
-				Categories:    meta.Subjects,
+				ISBN:            id,
+				Title:           title,
+				Author:          author,
+				PublishedDate:   pubDate,
+				Categories:      categories,
+				MediaType:       mediaType,
+				Narrator:        narrator,
+				DurationSeconds: durationSecs,
+				FileExt:         ext,
+				ASIN:            asin,
 			})
 		}
 	}
@@ -166,7 +268,7 @@ func (s *Server) UpdateCatalog(epubPaths []string) []BookMeta {
 	s.holdings = holdings
 	s.mu.Unlock()
 
-	log.Printf("branch: catalog updated — %d books, %d with ISBN", len(entries), len(books))
+	log.Printf("branch: catalog updated — %d total, %d audiobook(s)", len(entries), audiobookCount)
 	return books
 }
 
@@ -193,6 +295,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/catalog", localOnly(s.handleCatalog))
 	s.mux.HandleFunc("/api/status", localOnly(s.handleStatus))
 	s.mux.HandleFunc("/api/setup", localOnly(s.handleSetup))
+	s.mux.HandleFunc("/api/restart", localOnly(s.handleRestart))
+	s.mux.HandleFunc("/api/sync", localOnly(s.handleSyncNow))
 	s.mux.HandleFunc("/api/browse", localOnly(s.handleBrowse))
 	s.mux.HandleFunc("/favicon.ico", s.handleFavicon)
 	s.mux.HandleFunc("/covers/", s.handleLocalCover)
@@ -369,11 +473,18 @@ func (s *Server) serveSetupWizard(w http.ResponseWriter, r *http.Request) {
       <div class="slug" id="slug-preview" style="font-size:0.78rem;color:#C4A882;margin-top:0.3rem;font-family:monospace">%s.branch.pub</div>
     </div>
     <div class="form-group">
-      <label>Library Folder</label>
-      <div class="hint">Point to the folder containing your .epub files (EPUB format only). All subfolders are scanned recursively.</div>
-      <div id="picker-selected" class="picker-selected" style="display:none"></div>
+      <label>EPUB Library Folder</label>
+      <div class="hint">Folder containing your .epub files. Subfolders are scanned recursively.</div>
+      <div id="library_path-selected" class="picker-selected" style="display:none"></div>
       <input type="hidden" id="library_path" name="library_path">
-      <div id="picker" class="picker"></div>
+      <div id="library_path-picker" class="picker"></div>
+    </div>
+    <div class="form-group">
+      <label>Audiobook Folder <span style="font-weight:400;color:var(--brown-600);">(optional)</span></label>
+      <div class="hint">Folder containing your .m4b audiobooks. Leave blank to skip — you can add this later in Settings.</div>
+      <div id="audiobook_path-selected" class="picker-selected" style="display:none"></div>
+      <input type="hidden" id="audiobook_path" name="audiobook_path">
+      <div id="audiobook_path-picker" class="picker"></div>
     </div>
     <button type="submit" class="btn-primary" id="submit-btn">Set Up My Branch</button>
   </form>
@@ -393,46 +504,59 @@ func (s *Server) serveSetupWizard(w http.ResponseWriter, r *http.Request) {
   .picker-selected .change-btn { background:none; border:1px solid var(--brown-400); border-radius:6px; padding:0.2rem 0.6rem; font-size:0.75rem; cursor:pointer; color:var(--brown-600); }
 </style>
 <script>
-async function loadDir(path) {
+async function loadDir(field, path) {
   var url = '/api/browse' + (path ? '?path=' + encodeURIComponent(path) : '');
   var resp = await fetch(url);
   var data = await resp.json();
-  var picker = document.getElementById('picker');
+  var picker = document.getElementById(field + '-picker');
   picker.innerHTML = '';
   var header = document.createElement('div');
   header.className = 'picker-current';
-  header.innerHTML = '<span>' + data.current + '</span><button class="select-btn" onclick="selectFolder(\'' + data.current.replace(/\\/g, '\\\\').replace(/'/g, "\\'") + '\')">Select This Folder</button>';
+  var safe = data.current.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+  header.innerHTML = '<span>' + data.current + '</span><button class="select-btn" onclick="selectFolder(\'' + field + '\', \'' + safe + '\')">Select This Folder</button>';
   picker.appendChild(header);
   (data.entries || []).forEach(function(e) {
     if (!e.is_dir) return;
     var row = document.createElement('div');
     row.className = 'picker-row';
     row.innerHTML = '<span class="icon">' + (e.name === '..' ? '⬆' : '📁') + '</span><span class="name">' + e.name + '</span>';
-    row.onclick = function() { loadDir(e.path); };
+    row.onclick = function() { loadDir(field, e.path); };
     picker.appendChild(row);
   });
 }
-function selectFolder(path) {
-  document.getElementById('library_path').value = path;
-  document.getElementById('picker').style.display = 'none';
-  var sel = document.getElementById('picker-selected');
+function selectFolder(field, path) {
+  document.getElementById(field).value = path;
+  document.getElementById(field + '-picker').style.display = 'none';
+  var sel = document.getElementById(field + '-selected');
   sel.style.display = 'flex';
-  sel.innerHTML = '<span>' + path + '</span><button class="change-btn" onclick="changeFolder()">Change</button>';
+  var clearBtn = field === 'audiobook_path' ? '<button type="button" class="change-btn" style="margin-left:0.4rem;" onclick="clearFolder(\'' + field + '\')">Clear</button>' : '';
+  sel.innerHTML = '<span>' + path + '</span><button type="button" class="change-btn" onclick="changeFolder(\'' + field + '\')">Change</button>' + clearBtn;
 }
-function changeFolder() {
-  document.getElementById('picker').style.display = '';
-  document.getElementById('picker-selected').style.display = 'none';
-  document.getElementById('library_path').value = '';
+function changeFolder(field) {
+  document.getElementById(field + '-picker').style.display = '';
+  document.getElementById(field + '-selected').style.display = 'none';
+  document.getElementById(field).value = '';
+  loadDir(field, '');
 }
-loadDir('');
+function clearFolder(field) {
+  document.getElementById(field).value = '';
+  document.getElementById(field + '-picker').style.display = 'none';
+  document.getElementById(field + '-selected').style.display = 'none';
+}
+loadDir('library_path', '');
+loadDir('audiobook_path', '');
 
 async function submitSetup(e) {
   e.preventDefault();
   var btn = document.getElementById('submit-btn');
   var alert = document.getElementById('alert');
-  if (!document.getElementById('library_path').value) { alert.className='alert alert-error'; alert.textContent='Please select a library folder.'; alert.style.display='block'; return; }
+  if (!document.getElementById('library_path').value) { alert.className='alert alert-error'; alert.textContent='Please select an EPUB library folder.'; alert.style.display='block'; return; }
   btn.disabled = true; btn.textContent = 'Setting up...'; alert.style.display = 'none';
-  var body = { library_path: document.getElementById('library_path').value.trim(), display_name: document.getElementById('display_name').value.trim() };
+  var body = {
+    library_path: document.getElementById('library_path').value.trim(),
+    audiobook_path: document.getElementById('audiobook_path').value.trim(),
+    display_name: document.getElementById('display_name').value.trim()
+  };
   try {
     var resp = await fetch('/api/setup', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body) });
     var data = await resp.json();
@@ -696,8 +820,9 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		LibraryPath string `json:"library_path"`
-		DisplayName string `json:"display_name"`
+		LibraryPath   string `json:"library_path"`
+		AudiobookPath string `json:"audiobook_path"`
+		DisplayName   string `json:"display_name"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.Header().Set("Content-Type", "application/json")
@@ -707,6 +832,7 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 	}
 
 	req.LibraryPath = strings.TrimSpace(req.LibraryPath)
+	req.AudiobookPath = strings.TrimSpace(req.AudiobookPath)
 	if req.LibraryPath == "" {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(400)
@@ -723,11 +849,23 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Audiobook path is optional; validate only if provided.
+	if req.AudiobookPath != "" {
+		ai, err := os.Stat(req.AudiobookPath)
+		if err != nil || !ai.IsDir() {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Audiobook path does not exist or is not a directory"})
+			return
+		}
+	}
+
 	// Update config.
 	if s.cfg == nil {
 		s.cfg = &config.BranchConfig{Port: 1950, ServerURL: config.DefaultServerURL}
 	}
 	s.cfg.LibraryPath = req.LibraryPath
+	s.cfg.AudiobookPath = req.AudiobookPath
 	s.libraryDir = req.LibraryPath
 
 	if req.DisplayName != "" {
@@ -756,6 +894,46 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 		"library_path": s.cfg.LibraryPath,
 		"display_name": s.cfg.DisplayName,
 	})
+}
+
+// handleRestart asks the host process to restart the daemon. The HTTP
+// response is sent before the restart begins, so the browser sees a clean
+// 200 before the connection drops.
+func (s *Server) handleRestart(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", 405)
+		return
+	}
+	if s.onRestart == nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(501)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Restart not supported on this platform"})
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "restarting"})
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+	go s.onRestart()
+}
+
+// handleSyncNow triggers an immediate scan + Town Square sync. The actual
+// work runs in a goroutine so the HTTP response returns quickly.
+func (s *Server) handleSyncNow(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", 405)
+		return
+	}
+	if s.onSync == nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(503)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Daemon not ready"})
+		return
+	}
+	go s.onSync()
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "syncing"})
 }
 
 // handleBrowse returns a directory listing for the folder picker UI.
@@ -831,10 +1009,12 @@ func (s *Server) handleBrowse(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleSettingsPage(w http.ResponseWriter, r *http.Request) {
 	displayName := ""
 	libraryPath := ""
+	audiobookPath := ""
 	subdomain := ""
 	if s.cfg != nil {
 		displayName = s.cfg.DisplayName
 		libraryPath = s.cfg.LibraryPath
+		audiobookPath = s.cfg.AudiobookPath
 		subdomain = s.cfg.Subdomain
 	}
 
@@ -917,47 +1097,63 @@ func (s *Server) handleSettingsPage(w http.ResponseWriter, r *http.Request) {
       <div class="slug" id="slug-preview">%s.branch.pub</div>
     </div>
     <div class="form-group">
-      <label>Library Folder</label>
-      <div class="hint">Point to the folder containing your .epub files (EPUB format only). Subfolders are scanned recursively.</div>
-      <div id="picker-selected" class="picker-selected" style="%s"><span>%s</span><button type="button" class="change-btn" onclick="changeFolder()">Change</button></div>
+      <label>EPUB Library Folder</label>
+      <div class="hint">Folder containing your .epub files. Subfolders are scanned recursively.</div>
+      <div id="library_path-selected" class="picker-selected" style="%s"><span>%s</span><button type="button" class="change-btn" onclick="changeFolder('library_path')">Change</button></div>
       <input type="hidden" id="library_path" name="library_path" value="%s">
-      <div id="picker" class="picker" style="%s"></div>
+      <div id="library_path-picker" class="picker" style="%s"></div>
+    </div>
+    <div class="form-group">
+      <label>Audiobook Folder <span style="font-weight:400;color:var(--brown-600);">(optional)</span></label>
+      <div class="hint">Folder containing your .m4b audiobooks. Leave blank to skip audiobook sync. Subfolders are scanned recursively.</div>
+      <div id="audiobook_path-selected" class="picker-selected" style="%s"><span>%s</span><button type="button" class="change-btn" onclick="changeFolder('audiobook_path')">Change</button><button type="button" class="change-btn" style="margin-left:0.4rem;" onclick="clearFolder('audiobook_path')">Clear</button></div>
+      <input type="hidden" id="audiobook_path" name="audiobook_path" value="%s">
+      <div id="audiobook_path-picker" class="picker" style="%s"></div>
     </div>
     <button type="submit" class="btn-primary" id="submit-btn">Save Settings</button>
+    <button type="button" class="btn-primary" id="restart-btn" style="margin-top:0.6rem;display:none;background:linear-gradient(135deg,#C97A4D,#A85D34);" onclick="restartDaemon()">Restart Now to Apply</button>
   </form>
 </div>
 <script>
-async function loadDir(path) {
+async function loadDir(field, path) {
   var url = '/api/browse' + (path ? '?path=' + encodeURIComponent(path) : '');
   var resp = await fetch(url);
   var data = await resp.json();
-  var picker = document.getElementById('picker');
+  var picker = document.getElementById(field + '-picker');
   picker.innerHTML = '';
   var header = document.createElement('div');
   header.className = 'picker-current';
-  header.innerHTML = '<span>' + data.current + '</span><button class="select-btn" onclick="selectFolder(\'' + data.current.replace(/\\/g, '\\\\').replace(/'/g, "\\'") + '\')">Select This Folder</button>';
+  var safeCurrent = data.current.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+  header.innerHTML = '<span>' + data.current + '</span><button class="select-btn" onclick="selectFolder(\'' + field + '\', \'' + safeCurrent + '\')">Select This Folder</button>';
   picker.appendChild(header);
   (data.entries || []).forEach(function(e) {
     if (!e.is_dir) return;
     var row = document.createElement('div');
     row.className = 'picker-row';
     row.innerHTML = '<span class="icon">' + (e.name === '..' ? '⬆' : '📁') + '</span><span class="name">' + e.name + '</span>';
-    row.onclick = function() { loadDir(e.path); };
+    row.onclick = function() { loadDir(field, e.path); };
     picker.appendChild(row);
   });
 }
-function selectFolder(path) {
-  document.getElementById('library_path').value = path;
-  document.getElementById('picker').style.display = 'none';
-  var sel = document.getElementById('picker-selected');
+function selectFolder(field, path) {
+  document.getElementById(field).value = path;
+  document.getElementById(field + '-picker').style.display = 'none';
+  var sel = document.getElementById(field + '-selected');
   sel.style.display = 'flex';
-  sel.innerHTML = '<span>' + path + '</span><button type="button" class="change-btn" onclick="changeFolder()">Change</button>';
+  var clearBtn = field === 'audiobook_path' ? '<button type="button" class="change-btn" style="margin-left:0.4rem;" onclick="clearFolder(\'' + field + '\')">Clear</button>' : '';
+  sel.innerHTML = '<span>' + path + '</span><button type="button" class="change-btn" onclick="changeFolder(\'' + field + '\')">Change</button>' + clearBtn;
 }
-function changeFolder() {
-  document.getElementById('picker').style.display = '';
-  document.getElementById('picker-selected').style.display = 'none';
-  document.getElementById('library_path').value = '';
-  loadDir('');
+function changeFolder(field) {
+  document.getElementById(field + '-picker').style.display = '';
+  document.getElementById(field + '-selected').style.display = 'none';
+  document.getElementById(field).value = '';
+  loadDir(field, '');
+}
+function clearFolder(field) {
+  document.getElementById(field).value = '';
+  document.getElementById(field + '-picker').style.display = 'none';
+  var sel = document.getElementById(field + '-selected');
+  sel.style.display = 'none';
 }
 document.getElementById('display_name').addEventListener('input', function() {
   var slug = this.value.trim().toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '');
@@ -967,15 +1163,22 @@ async function saveSettings(e) {
   e.preventDefault();
   var btn = document.getElementById('submit-btn');
   var alert = document.getElementById('alert');
-  if (!document.getElementById('library_path').value) { alert.className='alert alert-error'; alert.textContent='Please select a library folder.'; alert.style.display='block'; return; }
+  if (!document.getElementById('library_path').value) { alert.className='alert alert-error'; alert.textContent='Please select an EPUB library folder.'; alert.style.display='block'; return; }
   btn.disabled = true; btn.textContent = 'Saving...'; alert.style.display = 'none';
-  var body = { library_path: document.getElementById('library_path').value.trim(), display_name: document.getElementById('display_name').value.trim() };
+  var body = {
+    library_path: document.getElementById('library_path').value.trim(),
+    audiobook_path: document.getElementById('audiobook_path').value.trim(),
+    display_name: document.getElementById('display_name').value.trim()
+  };
   try {
     var resp = await fetch('/api/setup', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body) });
     var data = await resp.json();
     if (!resp.ok) throw new Error(data.error || 'Save failed');
-    alert.className = 'alert alert-success'; alert.textContent = 'Settings saved! Rescanning library...'; alert.style.display = 'block';
+    alert.className = 'alert alert-success';
+    alert.innerHTML = 'Settings saved. Folder changes need a restart to take effect.';
+    alert.style.display = 'block';
     btn.disabled = false; btn.textContent = 'Save Settings';
+    document.getElementById('restart-btn').style.display = '';
     var slug = body.display_name.toLowerCase().replace(/[^a-z0-9-]/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '');
     document.getElementById('slug-preview').textContent = slug + '.branch.pub';
   } catch (err) {
@@ -983,12 +1186,30 @@ async function saveSettings(e) {
     btn.disabled = false; btn.textContent = 'Save Settings';
   }
 }
-if (!document.getElementById('library_path').value) { loadDir(''); }
+async function restartDaemon() {
+  var btn = document.getElementById('restart-btn');
+  var alert = document.getElementById('alert');
+  btn.disabled = true; btn.textContent = 'Restarting...';
+  try {
+    var resp = await fetch('/api/restart', { method: 'POST' });
+    var data = await resp.json();
+    if (!resp.ok) throw new Error(data.error || 'Restart failed');
+    alert.className = 'alert alert-success';
+    alert.innerHTML = 'Daemon restarting. This page will reconnect shortly...';
+    alert.style.display = 'block';
+    setTimeout(function() { window.location.reload(); }, 5000);
+  } catch (err) {
+    alert.className = 'alert alert-error'; alert.textContent = err.message; alert.style.display = 'block';
+    btn.disabled = false; btn.textContent = 'Restart Now to Apply';
+  }
+}
+if (!document.getElementById('library_path').value) { loadDir('library_path', ''); }
+if (!document.getElementById('audiobook_path').value) { loadDir('audiobook_path', ''); }
 </script>
 </body>
 </html>`, displayName, subdomain,
-		pickerSelectedStyle(libraryPath), libraryPath, libraryPath,
-		pickerBrowseStyle(libraryPath))
+		pickerSelectedStyle(libraryPath), libraryPath, libraryPath, pickerBrowseStyle(libraryPath),
+		pickerSelectedStyle(audiobookPath), audiobookPath, audiobookPath, pickerBrowseStyle(audiobookPath))
 }
 
 func pickerSelectedStyle(path string) string {
@@ -1114,8 +1335,15 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	w.Header().Set("Content-Type", "application/epub+zip")
-	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s.epub"`, isbn))
+	ext := strings.ToLower(filepath.Ext(filePath))
+	contentType := "application/epub+zip"
+	if ext == ".m4b" {
+		contentType = "audio/mp4"
+	} else {
+		ext = ".epub"
+	}
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s%s"`, isbn, ext))
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", finfo.Size()))
 	io.Copy(w, f)
 }

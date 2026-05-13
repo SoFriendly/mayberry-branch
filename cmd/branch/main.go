@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -232,11 +233,25 @@ func startBackgroundServices(ctx context.Context, cfg *config.BranchConfig, hubU
 
 	swap := &handlerSwap{handler: branchSrv}
 
-	// Start the HTTP server once — it runs for the lifetime of the process.
-	addr := fmt.Sprintf(":%d", cfg.Port)
-	httpSrv := &http.Server{Addr: addr, Handler: swap}
+	// Bind the HTTP server. If the configured port is in use (another
+	// daemon, leftover process), walk forward up to 10 ports until we find
+	// a free one. Then update cfg.Port so the tunnel and dashboard use the
+	// real bound port — this prevents the "tunnel works but localhost
+	// refuses" failure mode where readers see empty-body 502s.
+	listener, boundPort, err := listenWithRetry(cfg.Port, 10)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to bind any local port near %d: %v\n", cfg.Port, err)
+		os.Exit(1)
+	}
+	if boundPort != cfg.Port {
+		log.Printf("branch: port %d busy, listening on %d instead", cfg.Port, boundPort)
+		alog.Add(fmt.Sprintf("Port %d in use — using %d instead", cfg.Port, boundPort))
+		cfg.Port = boundPort
+		_ = config.SaveBranch(cfg)
+	}
+	httpSrv := &http.Server{Handler: swap}
 	go func() {
-		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := httpSrv.Serve(listener); err != nil && err != http.ErrServerClosed {
 			alog.Add(fmt.Sprintf("HTTP server error: %v", err))
 		}
 	}()
@@ -252,6 +267,7 @@ func startBackgroundServices(ctx context.Context, cfg *config.BranchConfig, hubU
 	branchSrv.SetSetupCallback(func(updated *config.BranchConfig) {
 		alog.Add(fmt.Sprintf("Web setup complete — library: %s", updated.LibraryPath))
 		cfg.LibraryPath = updated.LibraryPath
+		cfg.AudiobookPath = updated.AudiobookPath
 		cfg.DisplayName = updated.DisplayName
 		cfg.Subdomain = updated.Subdomain
 
@@ -259,13 +275,19 @@ func startBackgroundServices(ctx context.Context, cfg *config.BranchConfig, hubU
 		newSrv.SetConfig(cfg)
 		swap.Set(newSrv)
 
-		// Trigger an initial scan of the new library path.
-		epubs, err := storage.ScanDirectory(updated.LibraryPath)
-		if err == nil {
-			books := newSrv.UpdateCatalog(epubs)
-			state.setBookCount(len(epubs), len(books))
-			alog.Add(fmt.Sprintf("Initial scan: %d book(s), %d with ISBN", len(epubs), len(books)))
+		// Trigger an initial scan of both library paths.
+		var allPaths []string
+		if found, err := storage.ScanDirectory(updated.LibraryPath); err == nil {
+			allPaths = append(allPaths, found...)
 		}
+		if updated.AudiobookPath != "" {
+			if found, err := storage.ScanDirectory(updated.AudiobookPath); err == nil {
+				allPaths = append(allPaths, found...)
+			}
+		}
+		books := newSrv.UpdateCatalog(allPaths)
+		state.setBookCount(len(allPaths), len(books))
+		alog.Add(fmt.Sprintf("Initial scan: %d file(s), %d cataloged", len(allPaths), len(books)))
 
 		// Signal the TUI that setup is done.
 		select {
@@ -304,10 +326,16 @@ func startFullServices(ctx context.Context, cfg *config.BranchConfig, hubURL str
 		branchSrv = branchhttp.NewServer(branchID, cfg.LibraryPath)
 		branchSrv.SetConfig(cfg)
 		branchSrv.SetSetupCallback(func(updated *config.BranchConfig) {
-			// Settings changed — update config and rescan.
+			// Settings changed — update config. Watcher dirs apply on next restart.
 			cfg.LibraryPath = updated.LibraryPath
+			cfg.AudiobookPath = updated.AudiobookPath
 			cfg.DisplayName = updated.DisplayName
 			cfg.Subdomain = updated.Subdomain
+		})
+		branchSrv.SetRestartCallback(func() {
+			alog.Add("Restart requested from settings")
+			log.Printf("branch: restart requested from settings")
+			scheduleRestart()
 		})
 		swap.Set(branchSrv)
 		state.setStatus("townsquare", "connected")
@@ -323,34 +351,72 @@ func startFullServices(ctx context.Context, cfg *config.BranchConfig, hubURL str
 		fetchPublicKey(cfg.ServerURL, branchSrv)
 	}()
 
-	// Folder watcher
-	watcher := storage.NewWatcher(cfg.LibraryPath, 30*time.Second, func(epubs []string) {
-		books := branchSrv.UpdateCatalog(epubs)
-		state.setBookCount(len(epubs), len(books))
+	// Folder watcher — watches the EPUB folder plus the audiobook folder if set.
+	watchDirs := []string{cfg.LibraryPath}
+	if cfg.AudiobookPath != "" {
+		watchDirs = append(watchDirs, cfg.AudiobookPath)
+	}
+	scanAndSync := func(paths []string) {
+		books := branchSrv.UpdateCatalog(paths)
+		state.setBookCount(len(paths), len(books))
 		state.setStatus("watcher", "watching")
-		alog.Add(fmt.Sprintf("Scanned %d book(s), %d with ISBN", len(epubs), len(books)))
+		alog.Add(fmt.Sprintf("Scanned %d file(s), %d cataloged", len(paths), len(books)))
 		if branchID != "" {
 			syncBooks(cfg.ServerURL, branchID, branchSrv.CoverDir(), books)
-			alog.Add(fmt.Sprintf("Synced %d book(s) to Town Square", len(books)))
+			alog.Add(fmt.Sprintf("Synced %d title(s) to Town Square", len(books)))
 		}
-	})
+	}
+	watcher := storage.NewMultiWatcher(watchDirs, 30*time.Second, scanAndSync)
 	watcher.Start()
+
+	// /api/sync triggers a fresh scan that ignores the watcher's change-tracking.
+	branchSrv.SetSyncCallback(func() {
+		alog.Add("Manual sync requested")
+		var paths []string
+		for _, d := range watchDirs {
+			if found, err := storage.ScanDirectory(d); err == nil {
+				paths = append(paths, found...)
+			}
+		}
+		scanAndSync(paths)
+	})
 	state.setStatus("watcher", "watching")
-	alog.Add("Watching library: " + cfg.LibraryPath)
+	if cfg.AudiobookPath != "" {
+		alog.Add(fmt.Sprintf("Watching library: %s + audiobooks: %s", cfg.LibraryPath, cfg.AudiobookPath))
+	} else {
+		alog.Add("Watching library: " + cfg.LibraryPath)
+	}
+
+	// refreshTunnelToken fetches a fresh token. On 403 it re-registers (in case
+	// our saved branch_id was orphaned in the DB) and tries once more.
+	refreshTunnelToken := func() string {
+		token, status := fetchTunnelToken(cfg.ServerURL, branchID, cfg.Subdomain)
+		if token != "" {
+			return token
+		}
+		if status == http.StatusForbidden {
+			log.Printf("branch: re-registering after 403 from /api/tunnel/token")
+			alog.Add("Re-registering with Town Square (stale branch id)")
+			if newID := register(cfg); newID != "" {
+				branchID = newID
+				token, _ = fetchTunnelToken(cfg.ServerURL, branchID, cfg.Subdomain)
+				return token
+			}
+		}
+		return ""
+	}
 
 	// Tunnel — get a signed token from Town Square first.
 	tunnelToken := ""
 	if branchID != "" {
-		tunnelToken = fetchTunnelToken(cfg.ServerURL, branchID, cfg.Subdomain)
+		tunnelToken = refreshTunnelToken()
 		if tunnelToken != "" {
 			alog.Add("Obtained tunnel authorization token")
 		} else {
 			alog.Add("Warning: no tunnel token — hub may reject connection")
 		}
 	}
-	tun := tunnel.NewClient(cfg.Subdomain, cfg.Port, hubURL, tunnelToken, func() string {
-		return fetchTunnelToken(cfg.ServerURL, branchID, cfg.Subdomain)
-	})
+	tun := tunnel.NewClient(cfg.Subdomain, cfg.Port, hubURL, tunnelToken, refreshTunnelToken)
 	go func() {
 		alog.Add(fmt.Sprintf("Connecting tunnel %s.branch.pub...", cfg.Subdomain))
 		if err := tun.Connect(ctx); err != nil {
@@ -423,7 +489,10 @@ func register(cfg *config.BranchConfig) string {
 }
 
 // fetchTunnelToken requests a signed tunnel JWT from Town Square.
-func fetchTunnelToken(serverURL, branchID, subdomain string) string {
+// Returns the token and the HTTP status code. Empty token + status 403
+// means Town Square doesn't recognize our (branch_id, subdomain) and we
+// should re-register before retrying.
+func fetchTunnelToken(serverURL, branchID, subdomain string) (string, int) {
 	body, _ := json.Marshal(map[string]string{
 		"branch_id": branchID,
 		"subdomain": subdomain,
@@ -431,17 +500,23 @@ func fetchTunnelToken(serverURL, branchID, subdomain string) string {
 	resp, err := httpClient.Post(serverURL+"/api/tunnel/token", "application/json", bytes.NewReader(body))
 	if err != nil {
 		log.Printf("branch: tunnel token: %v", err)
-		return ""
+		return "", 0
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		log.Printf("branch: tunnel token rejected: HTTP %d — %s",
+			resp.StatusCode, strings.TrimSpace(string(body)))
+		return "", resp.StatusCode
+	}
 	var result struct {
 		Token string `json:"token"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		log.Printf("branch: tunnel token decode: %v", err)
-		return ""
+		return "", resp.StatusCode
 	}
-	return result.Token
+	return result.Token, resp.StatusCode
 }
 
 func syncBooks(serverURL, branchID, coverDir string, books []branchhttp.BookMeta) {
@@ -579,6 +654,9 @@ func main() {
 			return
 		case "version":
 			fmt.Println("mayberry " + Version)
+			return
+		case "sync":
+			handleSync()
 			return
 		}
 	}
@@ -831,11 +909,32 @@ func performAutoUpdate(alog *activityLog) bool {
 		return false
 	}
 
-	// macOS/Linux: schedule a detached restart that outlives this process.
-	// Using `sh -c` with background &: spawns a new process group that waits
-	// briefly then restarts the service. This works even if launchd's KeepAlive
-	// rate-limits us, because the shell command is independent.
 	log.Printf("auto-update: scheduling restart")
+	scheduleRestart()
+	return true
+}
+
+// listenWithRetry tries to bind on startPort, then walks forward up to
+// `tries` ports until it finds a free one. Returns the listener and the port
+// it actually bound to.
+func listenWithRetry(startPort, tries int) (net.Listener, int, error) {
+	var lastErr error
+	for i := 0; i < tries; i++ {
+		port := startPort + i
+		l, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+		if err == nil {
+			return l, port, nil
+		}
+		lastErr = err
+	}
+	return nil, 0, lastErr
+}
+
+// scheduleRestart spawns a detached shell command that restarts the daemon
+// after a 2-second delay, then exits this process. The detached child keeps
+// running independently, which avoids launchd KeepAlive rate-limiting on macOS.
+// Windows has no service manager wired up here — restart is a no-op.
+func scheduleRestart() {
 	switch runtime.GOOS {
 	case "darwin":
 		plist := macPlistPath()
@@ -846,12 +945,11 @@ func performAutoUpdate(alog *activityLog) bool {
 	case "linux":
 		script := fmt.Sprintf("sleep 2 && systemctl --user restart %s", linuxUnit)
 		exec.Command("sh", "-c", script).Start()
+	case "windows":
+		return
 	}
-
-	// Give the scheduled restart time to fire, then exit.
 	time.Sleep(1 * time.Second)
 	os.Exit(0)
-	return true
 }
 
 func checkForUpdate() {
@@ -873,6 +971,34 @@ func checkForUpdate() {
 	if info.Version != "" && info.Version != "unknown" && info.Version != Version {
 		fmt.Fprintf(os.Stderr, "\n  Update available: %s -> %s (run 'mayberry update' to install)\n\n", Version, info.Version)
 	}
+}
+
+// handleSync triggers an immediate scan + Town Square sync via the running
+// daemon's local HTTP endpoint. Reads the configured port from branch.json.
+func handleSync() {
+	cfg, err := config.LoadBranch()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "config: %v\n", err)
+		os.Exit(1)
+	}
+	port := cfg.Port
+	if port == 0 {
+		port = 1950
+	}
+	url := fmt.Sprintf("http://localhost:%d/api/sync", port)
+	resp, err := httpClient.Post(url, "application/json", nil)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Sync failed: is the mayberry daemon running? (%v)\n", err)
+		os.Exit(1)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		fmt.Fprintf(os.Stderr, "Sync rejected: HTTP %d — %s\n",
+			resp.StatusCode, strings.TrimSpace(string(body)))
+		os.Exit(1)
+	}
+	fmt.Println("Sync triggered. Check the daemon log or dashboard for progress.")
 }
 
 func handleUpdate() {

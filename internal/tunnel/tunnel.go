@@ -137,7 +137,10 @@ func (c *Client) readLoop(ctx context.Context, wsURL string) {
 		}
 	}()
 
-	localBase := fmt.Sprintf("http://localhost:%d", c.localPort)
+	// Use 127.0.0.1 explicitly. "localhost" can resolve to ::1 on some
+	// systems where the HTTP server is only bound to IPv4, causing every
+	// tunneled request to fail with connection-refused on the v6 address.
+	localBase := fmt.Sprintf("http://127.0.0.1:%d", c.localPort)
 	// No timeout: large downloads to slow clients can take many minutes,
 	// and TCP backpressure blocks the local body read.
 	localClient := &http.Client{}
@@ -169,18 +172,32 @@ func (c *Client) writeResponse(resp *tunnelResponse) error {
 	return c.conn.WriteJSON(resp)
 }
 
+// sendErrorResponse writes a single-message tunnel response with a plain-text
+// error body. Used when the local HTTP fetch never produces a real response,
+// so that the caller (and end user) sees a useful message instead of an
+// empty-body 5xx with no clue as to what went wrong.
+func (c *Client) sendErrorResponse(id string, status int, msg string) {
+	body := []byte(msg + "\n")
+	c.writeResponse(&tunnelResponse{
+		ID:      id,
+		Status:  status,
+		Headers: map[string]string{"Content-Type": "text/plain; charset=utf-8"},
+		Body:    base64.StdEncoding.EncodeToString(body),
+	})
+}
+
 // forwardToLocal sends a tunneled request to the local Branch HTTP server
 // and streams the response back through the WebSocket in chunks.
 func (c *Client) forwardToLocal(client *http.Client, localBase string, req tunnelRequest) {
 	bodyBytes, err := base64.StdEncoding.DecodeString(req.Body)
 	if err != nil {
-		c.writeResponse(&tunnelResponse{ID: req.ID, Status: 400})
+		c.sendErrorResponse(req.ID, 400, "Bad request body: "+err.Error())
 		return
 	}
 
 	httpReq, err := http.NewRequest(req.Method, localBase+req.Path, bytes.NewReader(bodyBytes))
 	if err != nil {
-		c.writeResponse(&tunnelResponse{ID: req.ID, Status: 502})
+		c.sendErrorResponse(req.ID, 502, "Failed to build local request: "+err.Error())
 		return
 	}
 
@@ -191,7 +208,9 @@ func (c *Client) forwardToLocal(client *http.Client, localBase string, req tunne
 
 	resp, err := client.Do(httpReq)
 	if err != nil {
-		c.writeResponse(&tunnelResponse{ID: req.ID, Status: 502})
+		log.Printf("tunnel: local fetch %s%s failed: %v", localBase, req.Path, err)
+		c.sendErrorResponse(req.ID, 502,
+			fmt.Sprintf("Branch local HTTP server (%s) unreachable: %v", localBase, err))
 		return
 	}
 	defer resp.Body.Close()

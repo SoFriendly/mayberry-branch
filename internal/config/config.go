@@ -10,13 +10,14 @@ import (
 
 // BranchConfig holds local Branch daemon configuration.
 type BranchConfig struct {
-	BranchID    string `json:"branch_id,omitempty"`
-	FriendlyID  string `json:"friendly_id"`
-	DisplayName string `json:"display_name"`
-	Subdomain   string `json:"subdomain"`
-	LibraryPath string `json:"library_path"`
-	Port        int    `json:"port"`
-	ServerURL   string `json:"server_url"`
+	BranchID      string `json:"branch_id,omitempty"`
+	FriendlyID    string `json:"friendly_id"`
+	DisplayName   string `json:"display_name"`
+	Subdomain     string `json:"subdomain"`
+	LibraryPath   string `json:"library_path"`             // EPUBs
+	AudiobookPath string `json:"audiobook_path,omitempty"` // M4Bs (optional)
+	Port          int    `json:"port"`
+	ServerURL     string `json:"server_url"`
 }
 
 
