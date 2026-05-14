@@ -1554,13 +1554,6 @@ document.getElementById('mirror-purge-btn').addEventListener('click', async func
     setTimeout(function() { btn.disabled = false; btn.textContent = 'Purge mirror'; }, 2000);
   }
 });
-document.getElementById('mirror_network').addEventListener('change', function() {
-  if (!this.checked) return;
-  if (localStorage.getItem('mayberry_mirror_disclosure_seen')) return;
-  var ok = confirm('Enable network mirror?\n\nThanks for helping keep the network resilient. Here is what happens when you turn this on:\n\n• Your branch slowly backs up the rarest books on Mayberry — the ones held by only one or two branches today.\n• Downloads are bounded by your size cap (default 100 GB) and your speed setting (default ~500 KB/s, one book every 10–15 minutes).\n• Originals always serve readers first. Your mirror only steps in when every original holder is offline.\n• Every file is hash-verified and format-checked before it lands on disk.\n• You can hit "Purge mirror" on this page at any time to clear everything immediately.\n\nWhen others mirror your books, the favor is returned. Enable?');
-  if (!ok) { this.checked = false; return; }
-  localStorage.setItem('mayberry_mirror_disclosure_seen', '1');
-});
 refreshMirrorStatus();
 setInterval(refreshMirrorStatus, 30000);
 </script>
