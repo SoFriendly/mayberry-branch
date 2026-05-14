@@ -27,6 +27,7 @@ import (
 	"github.com/sofriendly/mayberry/internal/branchhttp"
 	"github.com/sofriendly/mayberry/internal/config"
 	"github.com/sofriendly/mayberry/internal/friendlyid"
+	"github.com/sofriendly/mayberry/internal/mirror"
 	"github.com/sofriendly/mayberry/internal/storage"
 	"github.com/sofriendly/mayberry/internal/tunnel"
 )
@@ -439,6 +440,19 @@ func startFullServices(ctx context.Context, cfg *config.BranchConfig, hubURL str
 	// Auto-update check (every hour)
 	go autoUpdateLoop(ctx, alog)
 
+	// Network mirror (opt-in). Started after registration so it has a
+	// branch_id to send to Town Square; the manager handles its own
+	// startup jitter so this returns immediately.
+	if mgr := mirror.NewManager(cfg, branchID); mgr != nil {
+		alog.Add("Network mirror enabled — fetching candidates after startup jitter")
+		// Register the touch callback so eviction's "recently served"
+		// protection covers files we serve to peers.
+		branchSrv.SetMirrorServeCallback(mgr.OnServe)
+		branchSrv.SetMirrorStatsFn(mgr.Stats)
+		branchSrv.SetMirrorPurgeFn(mgr.Purge)
+		mgr.Start(ctx)
+	}
+
 	// Clean up on context cancellation.
 	go func() {
 		<-ctx.Done()
@@ -635,6 +649,26 @@ func envOr(key, fallback string) string {
 	return fallback
 }
 
+// splitCSV splits a comma-separated string into trimmed, non-empty entries.
+// An empty input returns nil (matches "no list" semantics in BranchConfig).
+func splitCSV(s string) []string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return nil
+	}
+	parts := strings.Split(s, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -670,7 +704,22 @@ func main() {
 	hubURL := flag.String("hub", envOr("MAYBERRY_HUB", config.DefaultHubURL), "tunnel hub URL")
 	port := flag.Int("port", 1950, "local HTTP port")
 	daemon := flag.Bool("daemon", false, "run in background without TUI")
+
+	// Network mirror flags — see MIRROR.md. Empty string / unset bool means
+	// "leave config value alone"; only flags the user explicitly passed take
+	// effect (detected via flag.Visit below).
+	mirrorNetwork := flag.Bool("mirror-network", false, "mirror other branches' books for failover (off by default)")
+	mirrorSize := flag.String("mirror-size", "", "max disk space to use for mirrored books, e.g. 100G")
+	mirrorOnly := flag.String("mirror-only", "", "comma-separated list of branches to mirror exclusively")
+	mirrorIgnore := flag.String("mirror-ignore", "", "comma-separated list of branches to never mirror from")
+	mirrorRate := flag.String("mirror-rate", "", "mirror download speed: slow|normal|fast")
+	mirrorServeRate := flag.String("mirror-serve-rate", "", "outbound bandwidth cap when serving mirror requests, e.g. 200K")
 	flag.Parse()
+
+	// Collect which flags the user actually set, so we only override config
+	// for flags that were explicitly passed.
+	setFlags := make(map[string]bool)
+	flag.Visit(func(f *flag.Flag) { setFlags[f.Name] = true })
 
 	// Load or create config
 	cfg, err := config.LoadBranch()
@@ -689,6 +738,39 @@ func main() {
 	}
 	if *port != 0 {
 		cfg.Port = *port
+	}
+
+	// Apply mirror flags, but only when the user explicitly passed them —
+	// otherwise leave the saved config value (or default) alone.
+	if setFlags["mirror-network"] {
+		cfg.MirrorNetwork = *mirrorNetwork
+	}
+	if setFlags["mirror-size"] {
+		if _, err := config.ParseSize(*mirrorSize); err != nil {
+			fmt.Fprintf(os.Stderr, "branch: invalid --mirror-size %q: %v\n", *mirrorSize, err)
+			os.Exit(1)
+		}
+		cfg.MirrorSize = *mirrorSize
+	}
+	if setFlags["mirror-only"] {
+		cfg.MirrorOnly = splitCSV(*mirrorOnly)
+	}
+	if setFlags["mirror-ignore"] {
+		cfg.MirrorIgnore = splitCSV(*mirrorIgnore)
+	}
+	if setFlags["mirror-rate"] {
+		if !config.IsValidMirrorRate(*mirrorRate) {
+			fmt.Fprintf(os.Stderr, "branch: invalid --mirror-rate %q (expected: slow|normal|fast)\n", *mirrorRate)
+			os.Exit(1)
+		}
+		cfg.MirrorRate = *mirrorRate
+	}
+	if setFlags["mirror-serve-rate"] {
+		if _, err := config.ParseSize(*mirrorServeRate); err != nil {
+			fmt.Fprintf(os.Stderr, "branch: invalid --mirror-serve-rate %q: %v\n", *mirrorServeRate, err)
+			os.Exit(1)
+		}
+		cfg.MirrorServeRate = *mirrorServeRate
 	}
 
 	// First run: generate friendly-id

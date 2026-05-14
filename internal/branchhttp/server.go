@@ -1,6 +1,7 @@
 package branchhttp
 
 import (
+	"context"
 	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/hex"
@@ -11,15 +12,77 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/sofriendly/mayberry/internal/audiobook"
 	"github.com/sofriendly/mayberry/internal/auth"
 	"github.com/sofriendly/mayberry/internal/config"
 	"github.com/sofriendly/mayberry/internal/epub"
+	"github.com/sofriendly/mayberry/internal/mirror"
 )
+
+// hashFilenameRe matches a 64-character lowercase hex filename — what the
+// mirror manager produces. The audiobook scanner falls back to filename
+// for titles when no embedded metadata is present; we MUST NOT surface
+// raw SHA-256s as titles, so we skip the fallback when this matches.
+var hashFilenameRe = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
+// hashCache memoizes file SHA-256 + size, keyed by absolute path and
+// invalidated when size or mtime change. Avoids rehashing every scan tick.
+type hashCache struct {
+	mu      sync.Mutex
+	entries map[string]hashEntry
+}
+
+type hashEntry struct {
+	size  int64
+	mtime time.Time
+	hash  string
+}
+
+func newHashCache() *hashCache {
+	return &hashCache{entries: make(map[string]hashEntry)}
+}
+
+// GetOrCompute returns the file's size and hex SHA-256. If a cached entry
+// matches the current size + mtime, the cached hash is returned without
+// re-reading the file.
+func (c *hashCache) GetOrCompute(path string) (int64, string, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0, "", err
+	}
+	size := info.Size()
+	mtime := info.ModTime()
+
+	c.mu.Lock()
+	e, ok := c.entries[path]
+	c.mu.Unlock()
+	if ok && e.size == size && e.mtime.Equal(mtime) {
+		return size, e.hash, nil
+	}
+
+	f, err := os.Open(path)
+	if err != nil {
+		return 0, "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return 0, "", err
+	}
+	hash := hex.EncodeToString(h.Sum(nil))
+
+	c.mu.Lock()
+	c.entries[path] = hashEntry{size: size, mtime: mtime, hash: hash}
+	c.mu.Unlock()
+	return size, hash, nil
+}
 
 // SetupCallback is called after the user completes the web setup wizard.
 // It receives the updated config so the caller can trigger a rescan.
@@ -34,6 +97,22 @@ type RestartCallback func()
 // requests an immediate scan + Town Square sync, bypassing the watcher poll.
 type SyncCallback func()
 
+// MirrorServeCallback is called after we successfully begin serving a
+// file out of our _mirror/ subfolder to a peer mirror client. The sha
+// argument is the file's content hash (its filename minus extension).
+// Used by the mirror manager to update last_served_at, which informs
+// eviction ranking.
+type MirrorServeCallback func(sha string)
+
+// MirrorStatsFn lets the dashboard endpoints render mirror status without
+// importing the mirror package directly into branchhttp's HTTP code path.
+// Returns nil-ish (zero-value Stats) when mirroring is disabled.
+type MirrorStatsFn func() mirror.Stats
+
+// MirrorPurgeFn deletes all mirrored content. Blocks until in-flight
+// downloads complete.
+type MirrorPurgeFn func() error
+
 // Server is the Branch local HTTP server providing the dashboard and download endpoint.
 type Server struct {
 	mux        *http.ServeMux
@@ -41,15 +120,25 @@ type Server struct {
 	libraryDir string
 	publicKey  ed25519.PublicKey
 	coverDir   string // cached cover images
+	hashes     *hashCache
+
+	// Mirror-serve throttling: size-1 semaphore so we only serve one
+	// mirror request at a time, plus a counter of in-flight real
+	// downloads so we can prioritize real users over mirrors.
+	mirrorServeSlots chan struct{}
+	realDownloads    atomic.Int32
 
 	mu       sync.RWMutex
 	catalog  []CatalogEntry // current epub catalog
 	holdings map[string]string // isbn -> filepath
 
-	cfg       *config.BranchConfig
-	onSetup   SetupCallback
-	onRestart RestartCallback
-	onSync    SyncCallback
+	cfg            *config.BranchConfig
+	onSetup        SetupCallback
+	onRestart      RestartCallback
+	onSync         SyncCallback
+	onMirrorServe  MirrorServeCallback
+	onMirrorStats  MirrorStatsFn
+	onMirrorPurge  MirrorPurgeFn
 }
 
 // CatalogEntry is a scanned epub with its metadata and path.
@@ -69,11 +158,13 @@ func NewServer(branchID, libraryDir string) *Server {
 	os.MkdirAll(coverDir, 0755)
 
 	s := &Server{
-		mux:        http.NewServeMux(),
-		branchID:   branchID,
-		libraryDir: libraryDir,
-		holdings:   make(map[string]string),
-		coverDir:   coverDir,
+		mux:              http.NewServeMux(),
+		branchID:         branchID,
+		libraryDir:       libraryDir,
+		holdings:         make(map[string]string),
+		coverDir:         coverDir,
+		hashes:           newHashCache(),
+		mirrorServeSlots: make(chan struct{}, 1),
 	}
 	s.routes()
 	return s
@@ -101,6 +192,24 @@ func (s *Server) SetSyncCallback(cb SyncCallback) {
 	s.onSync = cb
 }
 
+// SetMirrorServeCallback sets the function called when we serve a file
+// out of our _mirror/ subfolder.
+func (s *Server) SetMirrorServeCallback(cb MirrorServeCallback) {
+	s.onMirrorServe = cb
+}
+
+// SetMirrorStatsFn registers the function that reports live mirror
+// status to the dashboard.
+func (s *Server) SetMirrorStatsFn(fn MirrorStatsFn) {
+	s.onMirrorStats = fn
+}
+
+// SetMirrorPurgeFn registers the function that wipes mirrored content
+// when the user clicks "Purge mirror" in the dashboard.
+func (s *Server) SetMirrorPurgeFn(fn MirrorPurgeFn) {
+	s.onMirrorPurge = fn
+}
+
 // SetPublicKey sets the Town Square public key for JWT verification.
 // CoverDir returns the directory where extracted cover images are cached.
 func (s *Server) CoverDir() string {
@@ -123,6 +232,18 @@ type BookMeta struct {
 	DurationSeconds int      `json:"duration_seconds,omitempty"` // audiobook only
 	FileExt         string   `json:"file_ext,omitempty"`         // ".epub", ".m4b"
 	ASIN            string   `json:"asin,omitempty"`             // audiobook only
+
+	// Used by the network mirror feature: content_sha256 lets a mirror branch
+	// verify it received untampered bytes; size_bytes lets a mirror client
+	// reject oversize files before starting a download.
+	ContentSHA256 string `json:"content_sha256,omitempty"`
+	SizeBytes     int64  `json:"size_bytes,omitempty"`
+
+	// IsMirror is true when this branch holds the book because it mirrored
+	// the file from another branch (rather than the user adding it directly
+	// to their library). Town Square uses this to prefer originals during
+	// download routing.
+	IsMirror bool `json:"is_mirror,omitempty"`
 }
 
 func isAllDigits(s string) bool {
@@ -203,7 +324,13 @@ func (s *Server) UpdateCatalog(bookPaths []string) []BookMeta {
 			}
 			title, author = meta.Title, meta.Author
 			if title == "" {
-				title = strings.TrimSuffix(filepath.Base(p), filepath.Ext(p))
+				base := strings.TrimSuffix(filepath.Base(p), filepath.Ext(p))
+				// Mirrored audiobooks are named by SHA-256; surfacing that
+				// as a title would be ugly and useless. The audiobook gets
+				// skipped below because title stays empty.
+				if !hashFilenameRe.MatchString(base) {
+					title = base
+				}
 			}
 			narrator = meta.Narrator
 			pubDate = meta.Year
@@ -237,6 +364,14 @@ func (s *Server) UpdateCatalog(bookPaths []string) []BookMeta {
 			}
 		}
 
+		// Compute (or fetch cached) SHA-256 + size. A failure here is
+		// non-fatal: the catalog entry still lands without hash, sync just
+		// won't carry mirror-eligibility data until the next successful pass.
+		size, sha, err := s.hashes.GetOrCompute(p)
+		if err != nil {
+			log.Printf("branch: hash failed for %s: %v", filepath.Base(p), err)
+		}
+
 		entry := CatalogEntry{
 			Path:     p,
 			Title:    title,
@@ -259,6 +394,9 @@ func (s *Server) UpdateCatalog(bookPaths []string) []BookMeta {
 				DurationSeconds: durationSecs,
 				FileExt:         ext,
 				ASIN:            asin,
+				ContentSHA256:   sha,
+				SizeBytes:       size,
+				IsMirror:        mirror.IsMirrorPath(p),
 			})
 		}
 	}
@@ -298,6 +436,8 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/restart", localOnly(s.handleRestart))
 	s.mux.HandleFunc("/api/sync", localOnly(s.handleSyncNow))
 	s.mux.HandleFunc("/api/browse", localOnly(s.handleBrowse))
+	s.mux.HandleFunc("/api/mirror/status", localOnly(s.handleMirrorStatus))
+	s.mux.HandleFunc("/api/mirror/purge", localOnly(s.handleMirrorPurge))
 	s.mux.HandleFunc("/favicon.ico", s.handleFavicon)
 	s.mux.HandleFunc("/covers/", s.handleLocalCover)
 	s.mux.HandleFunc("/download/", s.handleDownload)
@@ -823,6 +963,15 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 		LibraryPath   string `json:"library_path"`
 		AudiobookPath string `json:"audiobook_path"`
 		DisplayName   string `json:"display_name"`
+
+		// Optional mirror settings — only applied when present in the request.
+		// The pointer types let us distinguish "field omitted" from "field set to zero value."
+		MirrorNetwork   *bool     `json:"mirror_network,omitempty"`
+		MirrorSize      *string   `json:"mirror_size,omitempty"`
+		MirrorOnly      *[]string `json:"mirror_only,omitempty"`
+		MirrorIgnore    *[]string `json:"mirror_ignore,omitempty"`
+		MirrorRate      *string   `json:"mirror_rate,omitempty"`
+		MirrorServeRate *string   `json:"mirror_serve_rate,omitempty"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		w.Header().Set("Content-Type", "application/json")
@@ -838,6 +987,30 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(400)
 		json.NewEncoder(w).Encode(map[string]string{"error": "Library path is required"})
 		return
+	}
+
+	// Validate mirror fields up front before touching cfg.
+	if req.MirrorSize != nil {
+		if _, err := config.ParseSize(*req.MirrorSize); err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Invalid mirror_size: " + err.Error()})
+			return
+		}
+	}
+	if req.MirrorRate != nil && !config.IsValidMirrorRate(*req.MirrorRate) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid mirror_rate (expected: slow|normal|fast)"})
+		return
+	}
+	if req.MirrorServeRate != nil {
+		if _, err := config.ParseSize(*req.MirrorServeRate); err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]string{"error": "Invalid mirror_serve_rate: " + err.Error()})
+			return
+		}
 	}
 
 	// Validate the path exists and is a directory.
@@ -871,6 +1044,26 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 	if req.DisplayName != "" {
 		s.cfg.DisplayName = req.DisplayName
 		s.cfg.Subdomain = config.Sanitize(req.DisplayName)
+	}
+
+	// Apply mirror settings (validated above).
+	if req.MirrorNetwork != nil {
+		s.cfg.MirrorNetwork = *req.MirrorNetwork
+	}
+	if req.MirrorSize != nil {
+		s.cfg.MirrorSize = *req.MirrorSize
+	}
+	if req.MirrorOnly != nil {
+		s.cfg.MirrorOnly = *req.MirrorOnly
+	}
+	if req.MirrorIgnore != nil {
+		s.cfg.MirrorIgnore = *req.MirrorIgnore
+	}
+	if req.MirrorRate != nil {
+		s.cfg.MirrorRate = *req.MirrorRate
+	}
+	if req.MirrorServeRate != nil {
+		s.cfg.MirrorServeRate = *req.MirrorServeRate
 	}
 
 	if err := config.SaveBranch(s.cfg); err != nil {
@@ -916,6 +1109,41 @@ func (s *Server) handleRestart(w http.ResponseWriter, r *http.Request) {
 		f.Flush()
 	}
 	go s.onRestart()
+}
+
+// handleMirrorStatus returns a JSON snapshot of mirror state for the
+// dashboard. Always returns 200 with a status payload — the "enabled"
+// field tells the UI whether to render mirror sections at all.
+func (s *Server) handleMirrorStatus(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if s.onMirrorStats == nil {
+		// Mirror not wired into this Server (mirror_network=false on
+		// boot). Return a sentinel "disabled" object so the dashboard
+		// JS can branch cleanly.
+		json.NewEncoder(w).Encode(mirror.Stats{Enabled: false})
+		return
+	}
+	json.NewEncoder(w).Encode(s.onMirrorStats())
+}
+
+// handleMirrorPurge wipes mirrored content. Blocks until any in-flight
+// download finishes (worst case ~10s on slow rate).
+func (s *Server) handleMirrorPurge(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", 405)
+		return
+	}
+	if s.onMirrorPurge == nil {
+		http.Error(w, "Mirror not enabled", 503)
+		return
+	}
+	if err := s.onMirrorPurge(); err != nil {
+		log.Printf("branch: mirror purge: %v", err)
+		http.Error(w, "Purge failed: "+err.Error(), 500)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "purged"})
 }
 
 // handleSyncNow triggers an immediate scan + Town Square sync. The actual
@@ -1011,11 +1239,13 @@ func (s *Server) handleSettingsPage(w http.ResponseWriter, r *http.Request) {
 	libraryPath := ""
 	audiobookPath := ""
 	subdomain := ""
+	var mirrorHTML string
 	if s.cfg != nil {
 		displayName = s.cfg.DisplayName
 		libraryPath = s.cfg.LibraryPath
 		audiobookPath = s.cfg.AudiobookPath
 		subdomain = s.cfg.Subdomain
+		mirrorHTML = mirrorSettingsHTML(s.cfg)
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -1110,6 +1340,7 @@ func (s *Server) handleSettingsPage(w http.ResponseWriter, r *http.Request) {
       <input type="hidden" id="audiobook_path" name="audiobook_path" value="%s">
       <div id="audiobook_path-picker" class="picker" style="%s"></div>
     </div>
+    %s
     <button type="submit" class="btn-primary" id="submit-btn">Save Settings</button>
     <button type="button" class="btn-primary" id="restart-btn" style="margin-top:0.6rem;display:none;background:linear-gradient(135deg,#C97A4D,#A85D34);" onclick="restartDaemon()">Restart Now to Apply</button>
   </form>
@@ -1165,10 +1396,17 @@ async function saveSettings(e) {
   var alert = document.getElementById('alert');
   if (!document.getElementById('library_path').value) { alert.className='alert alert-error'; alert.textContent='Please select an EPUB library folder.'; alert.style.display='block'; return; }
   btn.disabled = true; btn.textContent = 'Saving...'; alert.style.display = 'none';
+  function splitCSV(s) { return s.split(',').map(function(x){return x.trim();}).filter(function(x){return x;}); }
   var body = {
     library_path: document.getElementById('library_path').value.trim(),
     audiobook_path: document.getElementById('audiobook_path').value.trim(),
-    display_name: document.getElementById('display_name').value.trim()
+    display_name: document.getElementById('display_name').value.trim(),
+    mirror_network: document.getElementById('mirror_network').checked,
+    mirror_size: document.getElementById('mirror_size').value.trim(),
+    mirror_only: splitCSV(document.getElementById('mirror_only').value),
+    mirror_ignore: splitCSV(document.getElementById('mirror_ignore').value),
+    mirror_rate: document.getElementById('mirror_rate').value,
+    mirror_serve_rate: document.getElementById('mirror_serve_rate').value.trim()
   };
   try {
     var resp = await fetch('/api/setup', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body) });
@@ -1205,11 +1443,150 @@ async function restartDaemon() {
 }
 if (!document.getElementById('library_path').value) { loadDir('library_path', ''); }
 if (!document.getElementById('audiobook_path').value) { loadDir('audiobook_path', ''); }
+
+// --- Mirror status + purge + disclosure ---
+function fmtBytes(b) {
+  if (!b) return '0 B';
+  var u = ['B','KB','MB','GB','TB']; var i = 0;
+  while (b >= 1024 && i < u.length - 1) { b /= 1024; i++; }
+  return b.toFixed(b >= 10 || i === 0 ? 0 : 1) + ' ' + u[i];
+}
+function relTime(iso) {
+  if (!iso || iso.indexOf('0001-') === 0) return '';
+  var s = (Date.now() - new Date(iso).getTime()) / 1000;
+  if (s < 60) return Math.floor(s) + 's ago';
+  if (s < 3600) return Math.floor(s/60) + 'm ago';
+  if (s < 86400) return Math.floor(s/3600) + 'h ago';
+  return Math.floor(s/86400) + 'd ago';
+}
+async function refreshMirrorStatus() {
+  try {
+    var r = await fetch('/api/mirror/status');
+    if (!r.ok) return;
+    var s = await r.json();
+    var panel = document.getElementById('mirror-status-panel');
+    var btn = document.getElementById('mirror-purge-btn');
+    if (!s.enabled) { panel.style.display = 'none'; btn.style.display = 'none'; return; }
+    panel.style.display = ''; btn.style.display = '';
+    document.getElementById('mirror-usage').textContent =
+      fmtBytes(s.size_used_bytes) + ' of ' + fmtBytes(s.size_cap_bytes) + ' used — ' +
+      (s.files_count || 0) + ' file(s) from ' + (s.sources_count || 0) + ' source(s)';
+    var lastEl = document.getElementById('mirror-last-download');
+    if (s.last_download_at && s.last_download_at.indexOf('0001-') !== 0) {
+      lastEl.textContent = 'Last download: ' + (s.last_download_book || '—') + ' (' + relTime(s.last_download_at) + ')';
+    } else {
+      lastEl.textContent = 'No downloads yet';
+    }
+    var ul = document.getElementById('mirror-events');
+    ul.innerHTML = '';
+    (s.recent_events || []).slice(0, 5).forEach(function(e) {
+      var li = document.createElement('li');
+      li.style.padding = '0.2rem 0';
+      var color = e.kind === 'accepted' ? '#3F804E' : '#A04040';
+      var book = e.book_id ? ' ' + e.book_id : '';
+      var reason = e.reason ? ' — ' + e.reason : '';
+      li.innerHTML = '<span style="color:' + color + ';font-weight:600">' + e.kind + '</span>' +
+                     book + ' <span style="color:#A0937D">' + relTime(e.at) + '</span>' + reason;
+      ul.appendChild(li);
+    });
+  } catch (err) { /* network blips are fine; next interval retries */ }
+}
+document.getElementById('mirror-purge-btn').addEventListener('click', async function() {
+  if (!confirm('Delete all mirrored books? This frees disk space immediately and cannot be undone.')) return;
+  var btn = this;
+  btn.disabled = true; btn.textContent = 'Purging...';
+  try {
+    var r = await fetch('/api/mirror/purge', { method: 'POST' });
+    if (!r.ok) throw new Error(await r.text());
+    btn.textContent = 'Purged ✓';
+    setTimeout(refreshMirrorStatus, 400);
+  } catch (err) {
+    alert('Purge failed: ' + err.message);
+  } finally {
+    setTimeout(function() { btn.disabled = false; btn.textContent = 'Purge mirror'; }, 2000);
+  }
+});
+document.getElementById('mirror_network').addEventListener('change', function() {
+  if (!this.checked) return;
+  if (localStorage.getItem('mayberry_mirror_disclosure_seen')) return;
+  var ok = confirm('Network mirror notice:\n\nYou will host copies of other branches’ files so the network stays resilient when those branches go offline. Downloads are slow and rate-limited, the mirror respects your size cap, and you can purge everything from this page at any time.\n\nEnable network mirror?');
+  if (!ok) { this.checked = false; return; }
+  localStorage.setItem('mayberry_mirror_disclosure_seen', '1');
+});
+refreshMirrorStatus();
+setInterval(refreshMirrorStatus, 30000);
 </script>
 </body>
 </html>`, displayName, subdomain,
 		pickerSelectedStyle(libraryPath), libraryPath, libraryPath, pickerBrowseStyle(libraryPath),
-		pickerSelectedStyle(audiobookPath), audiobookPath, audiobookPath, pickerBrowseStyle(audiobookPath))
+		pickerSelectedStyle(audiobookPath), audiobookPath, audiobookPath, pickerBrowseStyle(audiobookPath),
+		mirrorHTML)
+}
+
+// mirrorSettingsHTML renders the Network Mirror form section. Kept separate
+// from the main settings template because it has its own conditional logic
+// (checked/selected attributes) that would clutter the inline HTML.
+func mirrorSettingsHTML(cfg *config.BranchConfig) string {
+	checked := ""
+	if cfg.MirrorNetwork {
+		checked = "checked"
+	}
+	sel := func(want string) string {
+		if cfg.MirrorRate == want {
+			return "selected"
+		}
+		return ""
+	}
+	only := strings.Join(cfg.MirrorOnly, ", ")
+	ignore := strings.Join(cfg.MirrorIgnore, ", ")
+	size := cfg.MirrorSize
+	if size == "" {
+		size = config.DefaultMirrorSize
+	}
+	serve := cfg.MirrorServeRate
+	if serve == "" {
+		serve = config.DefaultMirrorServeRate
+	}
+	return fmt.Sprintf(`
+    <div class="form-group" style="margin-top:2rem;padding-top:1.5rem;border-top:1px solid #E8DED0">
+      <div style="display:flex;align-items:center;gap:0.5rem;margin-bottom:0.5rem">
+        <span style="font-size:0.7rem;background:#FFE4C4;color:#8B4513;padding:0.15rem 0.5rem;border-radius:10px;font-weight:600;letter-spacing:0.05em;text-transform:uppercase">Beta</span>
+        <strong style="font-size:0.95rem;color:#4A3728">Network Mirror</strong>
+      </div>
+      <div class="hint" style="margin-bottom:1rem">Mirror books from other branches so they remain available if those branches go offline. The download client ships in a later update — for now you can configure preferences.</div>
+      <label style="display:flex;align-items:center;gap:0.5rem;font-size:0.9rem;font-weight:500;margin-bottom:1rem;cursor:pointer">
+        <input type="checkbox" id="mirror_network" %s>
+        Enable network mirror
+      </label>
+      <label for="mirror_size" style="display:block;font-size:0.85rem;font-weight:600;margin-bottom:0.25rem">Mirror size limit</label>
+      <div class="hint">Maximum disk space to use, e.g. 100G, 50G, 500M.</div>
+      <input type="text" id="mirror_size" value="%s" style="margin-bottom:0.9rem">
+      <label for="mirror_only" style="display:block;font-size:0.85rem;font-weight:600;margin-bottom:0.25rem">Only mirror from (optional)</label>
+      <div class="hint">Comma-separated branch subdomains. Leave empty for "any branch with rare books".</div>
+      <input type="text" id="mirror_only" value="%s" placeholder="janes-library, oak-grove" style="margin-bottom:0.9rem">
+      <label for="mirror_ignore" style="display:block;font-size:0.85rem;font-weight:600;margin-bottom:0.25rem">Never mirror from (optional)</label>
+      <div class="hint">Comma-separated branch subdomains to skip.</div>
+      <input type="text" id="mirror_ignore" value="%s" style="margin-bottom:0.9rem">
+      <label for="mirror_rate" style="display:block;font-size:0.85rem;font-weight:600;margin-bottom:0.25rem">Mirror speed</label>
+      <div class="hint">Slow: ~6 books/hr at 500 KB/s. Normal: ~12/hr at 1 MB/s. Fast: ~30/hr at 5 MB/s.</div>
+      <select id="mirror_rate" style="width:100%%;padding:0.7rem 0.9rem;border:1.5px solid #DDD5CA;border-radius:8px;background:#FAF8F5;font-size:0.95rem;color:#3B2314;margin-bottom:0.9rem">
+        <option value="slow" %s>Slow</option>
+        <option value="normal" %s>Normal</option>
+        <option value="fast" %s>Fast</option>
+      </select>
+      <label for="mirror_serve_rate" style="display:block;font-size:0.85rem;font-weight:600;margin-bottom:0.25rem">Outbound mirror serve rate</label>
+      <div class="hint">Bandwidth cap when others mirror from your branch, e.g. 200K, 1M.</div>
+      <input type="text" id="mirror_serve_rate" value="%s">
+
+      <div id="mirror-status-panel" style="margin-top:1.25rem;padding:0.9rem 1rem;background:#FAF6F0;border:1px solid #E8DCC8;border-radius:8px;display:none">
+        <div style="font-size:0.8rem;font-weight:700;color:#4A3728;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:0.5rem">Mirror status</div>
+        <div id="mirror-usage" style="font-size:0.85rem;color:#5C4A38;margin-bottom:0.4rem"></div>
+        <div id="mirror-last-download" style="font-size:0.82rem;color:#8A7968;margin-bottom:0.75rem"></div>
+        <div style="font-size:0.75rem;font-weight:700;color:#8A7968;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:0.3rem">Recent activity</div>
+        <ul id="mirror-events" style="list-style:none;padding:0;margin:0;font-size:0.78rem;color:#5C4A38"></ul>
+      </div>
+      <button type="button" id="mirror-purge-btn" style="margin-top:0.6rem;display:none;background:#C97A4D;color:white;border:none;padding:0.55rem 1rem;border-radius:8px;font-size:0.85rem;font-weight:600;cursor:pointer">Purge mirror</button>
+    </div>`, checked, size, only, ignore, sel("slow"), sel("normal"), sel("fast"), serve)
 }
 
 func pickerSelectedStyle(path string) string {
@@ -1278,6 +1655,31 @@ func (s *Server) handleLocalCover(w http.ResponseWriter, r *http.Request) {
 // --- Download (Handshake Protocol) ---
 
 func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
+	// Mirror-serve admission: a request with X-Mayberry-Mirror=1 is from
+	// another branch's mirror manager, not a real reader. Real users always
+	// take priority — we refuse mirror serves while any real download is
+	// in flight, and we only serve one mirror at a time. See Phase 4 in
+	// MIRROR.md.
+	isMirror := r.Header.Get("X-Mayberry-Mirror") == "1"
+	if isMirror {
+		select {
+		case s.mirrorServeSlots <- struct{}{}:
+			defer func() { <-s.mirrorServeSlots }()
+		default:
+			w.Header().Set("Retry-After", "60")
+			http.Error(w, "Mirror serve capacity full", http.StatusServiceUnavailable)
+			return
+		}
+		if s.realDownloads.Load() > 0 {
+			w.Header().Set("Retry-After", "60")
+			http.Error(w, "Serving real downloads — try again later", http.StatusServiceUnavailable)
+			return
+		}
+	} else {
+		s.realDownloads.Add(1)
+		defer s.realDownloads.Add(-1)
+	}
+
 	// Path: /download/{isbn}?token={jwt}
 	isbn := strings.TrimPrefix(r.URL.Path, "/download/")
 	isbn = strings.TrimSuffix(isbn, "/")
@@ -1345,5 +1747,94 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s%s"`, isbn, ext))
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", finfo.Size()))
+
+	if isMirror {
+		// Fire the touch callback BEFORE the slow throttled write begins,
+		// so eviction's "recently served" window protects the file
+		// throughout the transfer rather than only at completion.
+		if s.onMirrorServe != nil {
+			if sha := shaFromMirrorPath(filePath); sha != "" {
+				s.onMirrorServe(sha)
+			}
+		}
+		// Throttle mirror serves so we don't saturate the link the user
+		// is reading on. The configured rate is parsed every request so a
+		// settings change takes effect immediately without restart.
+		rate := serveRate(s.cfg)
+		if _, err := throttledCopy(r.Context(), w, f, rate); err != nil {
+			// Connection drops mid-mirror are routine — log quietly.
+			log.Printf("branch: mirror serve aborted (%s): %v", isbn, err)
+		}
+		return
+	}
 	io.Copy(w, f)
+}
+
+// shaFromMirrorPath extracts the SHA-256 hash from a mirror file path.
+// Returns "" for paths that aren't under _mirror/ or don't have the
+// expected <hash>.<ext> filename shape.
+func shaFromMirrorPath(p string) string {
+	if !mirror.IsMirrorPath(p) {
+		return ""
+	}
+	base := filepath.Base(p)
+	name := strings.TrimSuffix(base, filepath.Ext(base))
+	if !hashFilenameRe.MatchString(name) {
+		return ""
+	}
+	return name
+}
+
+// serveRate parses cfg.MirrorServeRate to a bytes-per-second cap. Zero
+// disables throttling (treats as unlimited).
+func serveRate(cfg *config.BranchConfig) int64 {
+	if cfg == nil || cfg.MirrorServeRate == "" {
+		// Fall back to the documented default if config is missing.
+		n, _ := config.ParseSize(config.DefaultMirrorServeRate)
+		return n
+	}
+	n, err := config.ParseSize(cfg.MirrorServeRate)
+	if err != nil || n <= 0 {
+		n, _ = config.ParseSize(config.DefaultMirrorServeRate)
+	}
+	return n
+}
+
+// throttledCopy streams src to dst with a sleep-based bytes/sec cap.
+// Simple implementation: write a chunk, measure how long it took, sleep
+// the remainder of the "should have taken" budget. Good enough to be a
+// polite-neighbor; not a precise traffic shaper.
+func throttledCopy(ctx context.Context, dst io.Writer, src io.Reader, bytesPerSec int64) (int64, error) {
+	const chunkSize = 32 * 1024
+	buf := make([]byte, chunkSize)
+	var total int64
+	for {
+		if ctx.Err() != nil {
+			return total, ctx.Err()
+		}
+		started := time.Now()
+		n, rerr := src.Read(buf)
+		if n > 0 {
+			if _, werr := dst.Write(buf[:n]); werr != nil {
+				return total, werr
+			}
+			total += int64(n)
+		}
+		if bytesPerSec > 0 && n > 0 {
+			budget := time.Duration(float64(n) / float64(bytesPerSec) * float64(time.Second))
+			if extra := budget - time.Since(started); extra > 0 {
+				select {
+				case <-ctx.Done():
+					return total, ctx.Err()
+				case <-time.After(extra):
+				}
+			}
+		}
+		if rerr == io.EOF {
+			return total, nil
+		}
+		if rerr != nil {
+			return total, rerr
+		}
+	}
 }
