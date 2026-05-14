@@ -21,7 +21,7 @@ type BranchConfig struct {
 	Port          int    `json:"port"`
 	ServerURL     string `json:"server_url"`
 
-	// Network mirror — see MIRROR.md. Phase 1 plumbs the settings only.
+	// Network mirror — see MIRROR.md.
 	MirrorNetwork   bool     `json:"mirror_network"`
 	MirrorSize      string   `json:"mirror_size"`       // e.g. "100G", "500M"
 	MirrorOnly      []string `json:"mirror_only"`       // exclusive allowlist of subdomains

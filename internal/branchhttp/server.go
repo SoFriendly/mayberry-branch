@@ -32,6 +32,68 @@ import (
 // raw SHA-256s as titles, so we skip the fallback when this matches.
 var hashFilenameRe = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
+// Brand assets — kept in sync with joinmayberry.com. The SVG uses
+// currentColor for fill so the same markup works on light and dark
+// backgrounds; the wordmark/header chooses the parent text color.
+const mayberryLogoSVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 711.6 707.37" fill="currentColor" aria-hidden="true"><path d="M366.38,685c22.98,1.35,10.84-16.06,35.47-35.91,15.02-12.1,34.31-19.17,54.28-19.22,16.04,0,131.74-.55,144.66.01l9.54,18.33-161.16.38c-13.14.03-24.39,6.94-35.12,14.25,22.77,2.1,182.56.82,208.85,1.18l.14,22.06h-220.52c-4.93,10.76-14.17,19.74-26.53,20.42-23.11.31-55.65,6.68-65.76-20.28l-220.87.12-.02-22.44c52.19.31,157.18-.05,209.22-.82-11.05-8.55-23.16-14.41-36.55-14.44l-159.6-.32,9.7-18.83c29.69-.23,111.13.12,141.92.2,31.37.23,64.99,15.5,75.95,46.39,3.05,8.07,7.51,9.23,16.1,8.89-4.65-43.08-46.07-70.36-87.03-71.07-35.26-.02-106.32-.35-141.53-.65,18.94-20.09,57.16-60.38,76.18-80.31,34.64-8.91,97.39-1.23,103.15-49.34,2.34-29.19.94-58.85.48-88.78-.25-16.63-9.19-31.58-20.19-43.04-36.45-36.14-73.63-5.99-102.11,22.96-19.15,17.19-43.44,26.9-69.62,26.91l-.3-23.06c37.95.94,63.99-30.32,90.27-53.04-66.43,1.66-127.76,49.04-195.38,33.46l1.73-23.34c29.31,5.55,56.14,2.51,83.66-7.42-28.97-26.2-38.01-35.64-77.94-43.54l4.37-22.64c66.65,6.55,85.68,65.18,113.48,53.6,16.08-5.65,32.11-9.66,49.5-12.53-14.58-13.47-26.93-26.18-35.46-43.93l18.97-1.37c4.09-.3,7.04-.26,9.39,3.41,27.55,46.95,92.25,38.34,128.43,74.98-3.93-53.48-50.85-91.77-102.1-95.2-57.34-2.74-115.51,10.45-165.69-25.19l9.88-21.38c25.57,16.18,53.37,25.29,83.51,23.53-8.31-30.39-28.81-53.29-56.16-68.52l14.27-18.84c34.63,18.28,55.65,50.17,66.98,86.66,26.26-.97,45.73-1.71,72.63,4.35-7.53-12.85-14.51-25.1-19.78-38.66-20.01-51.49-61.58-38.61-90.42-85.25l17.12-15.4c11.76,21.48,38.88,33.51,59.08,45.03-2.75-25.29-10.79-49.01-23.77-70.79l19.85-12.39c15.91,26.85,20.04,42.05,27.18,73.34,15.98-29.54,20.89-58.37,14.28-92.81l21-7.55c27.54,76.34-48.12,120.29-10.62,182.29,38.89,57.87,88.01,71.32,87.7,154.26,0,0-.22,126.96-.22,126.96,1.56,40.24-36.12,70.65-60.85,97.18l-32.51-.55,30.8-30.87-55.24,7.86c-7.11,6.44-31.44,33.08-38.44,40.42,62.28.95,160.05-12.42,191.63,58.81,38.63-75.67,123.88-54.06,190.9-59.95l-37.34-39.11-54.04-8.28-1.22.87,31.07,30.42-32.32.38c-25.9-27.37-61.1-53.52-61.38-94.99,0,0-.04-139.37-.04-139.37-.62-73.19,59.96-95.18,90.68-150.15,29.3-59.85-39.73-95.28-14.5-176.18l21.43,7.53c-6.71,33.45-1.94,63.6,14.49,92.88,6-29.45,11.44-47.75,26.54-73.29,7.66,4.13,13.5,7.61,20.1,12.55-13.36,22-21.03,45.39-23.57,70.69,21.17-11.94,46.3-23.38,58.91-45.51l17.46,16.19c-20.94,37.25-74.26,39.96-89.02,81.6-5.84,14.59-12.86,27.86-21.3,41.52,27.87-5.14,45.14-5.1,72.37-3.95,11.44-36.78,33.5-68.41,67.6-87.22l14.06,19.23c-26.55,14.16-49.65,38.72-55.53,68.61,29.93,1.44,56.9-6.63,82.55-23.41,4.07,7.44,7.12,13.84,10.16,21.39-62.25,45.69-134.16,8.98-202.75,34-36.61,14.44-61.93,47.16-65.53,87.14,36.61-37.16,99.57-28.64,128.36-74.99,2.73-3.99,4.84-4.58,9.6-4.24l19.01,1.37c-8.62,17.61-20.54,30.8-34.91,43.73,17.64,3.02,33.92,7.52,50.49,12.93,27.66,9.7,45.62-46.75,111.91-54.03l4.85,22.78c-30.45,4.56-54.79,19.99-75.75,41.58-1.3.99-1.29,1.79.28,2.68,25.78,9.75,54.41,11.15,81.6,7.53l.17,23.34c-68.78,13.52-126.94-32.11-194.21-34.42,27.33,24.91,49.5,51.81,89.54,53.33l-.14,23.28c-79.7,2.62-100.6-104.28-168.67-52.88-34.23,24.16-20.99,89.44-23.26,124.57-1.11,56.84,66.03,50.04,104.06,59.14l34.73,36.34c6.76,7.66,35.45,35.98,40.51,44.03-65.94,7.76-215.87-29.35-227.78,71.84Z"/><path d="M367.82,324.52c-4.13,89.41,18.35,194.27-44.31,271.12l-21.26-9.47c18.1-31.05,42.51-64.9,41.94-102.46,0,0,.32-159.85.32-159.85.01-5.46-.58-10.23-.97-15.4-1.97-77.67-83.73-103.73-93.47-179.68l21.25-6.44c2.53,7.43,6.25,22.95,10.69,29.48,3.95-20.12,11.88-37.24,23.55-53.55,2.04-2.85,5.6-8.01,5.23-11.45-.96-8.81-5.94-16.14-10.98-23.05-12-16.46-19.34-35.03-19.56-55.62l22.6-4c-.57,22.14,12.98,42.67,25.02,60.08,12.34-19.38,17.67-40.49,17.56-64.22l23.35.64c.3,49.6-19.25,75.39-45.44,113.13-18.23,25.43-29.99,67.5-3.08,91.01,21.81-84.67,88.13-97.54,88.67-200.59,7.97.68,15.22,2.25,23.08,4.6-1.64,19.59-3.76,38.09-9.01,56.79-16.24,44-33.14,59.53-.47,104.32,9.67-15.06,13.85-30.5,18.47-47.55l21.49,5.67c-11.35,83.67-99.78,103.74-94.67,196.5ZM384.14,215.17c35.97-37.46,17.73-15.17-2.39-75.91-31.36,39.24-54.13,71.98-25.33,120.45,6.78-16.6,15.41-31.3,27.72-44.55Z"/><path d="M410.17,585.9l-21.41,9.79-22.44-37.99,10.96-29.12c7.63,14.64,24.08,43.42,32.9,57.33Z"/></svg>`
+
+// bookGlyphSVG is the placeholder used in the dashboard catalog list when a
+// book has no cover. Lucide-style stroked book with currentColor.
+const bookGlyphSVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>`
+
+// brandFontLinks pulls in Newsreader (serif headings) and Geist Mono
+// (monospaced labels) from Google Fonts — same families the landing page uses.
+const brandFontLinks = `<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Newsreader:opsz,wght@6..72,500;6..72,600;6..72,700&amp;family=Geist+Mono:wght@400;500&amp;display=swap">`
+
+// brandCSSTokens is the shared :root variable block + body/heading
+// defaults. Each page appends its own component CSS after this.
+// NOTE: the literal "%%" pairs here are required because this const is
+// concatenated into fmt.Fprintf format strings — Fprintf collapses
+// "%%" back to a single "%" when it emits the HSL values.
+const brandCSSTokens = `
+  *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+  :root {
+    --background: 40 20%% 97%%;
+    --foreground: 210 20%% 12%%;
+    --card: 0 0%% 100%%;
+    --card-foreground: 210 20%% 12%%;
+    --primary: 145 40%% 25%%;
+    --primary-foreground: 40 20%% 97%%;
+    --secondary: 40 15%% 92%%;
+    --secondary-foreground: 210 20%% 12%%;
+    --muted: 40 15%% 92%%;
+    --muted-foreground: 210 10%% 46%%;
+    --accent: 25 80%% 50%%;
+    --accent-foreground: 0 0%% 100%%;
+    --destructive: 0 84%% 60%%;
+    --border: 0 0%% 0%%;
+    --input: 40 15%% 88%%;
+    --success: 145 40%% 35%%;
+    --radius: 0.5rem;
+    --font-serif: 'Newsreader', Georgia, 'Times New Roman', serif;
+    --font-mono: 'Geist Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    --font-sans: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+    --shadow-sm: 0 1px 2px rgba(0,0,0,0.04);
+    --shadow-md: 0 4px 12px rgba(0,0,0,0.06);
+    --shadow-stack: 0 0 0 1px rgba(0,0,0,0.03), 0 2px 4px rgba(0,0,0,0.05), 0 12px 24px rgba(0,0,0,0.05);
+    --shadow-inset: inset 0 1px 2px rgba(0,0,0,0.05);
+  }
+  body {
+    font-family: var(--font-sans);
+    background: hsl(var(--background));
+    color: hsl(var(--foreground));
+    min-height: 100vh;
+    -webkit-font-smoothing: antialiased;
+  }
+  h1, h2, h3 { font-family: var(--font-serif); font-weight: 600; letter-spacing: -0.01em; }
+  .mono { font-family: var(--font-mono); }
+  .wordmark { display: inline-flex; align-items: center; gap: 0.75rem; text-decoration: none; color: inherit; }
+  .wordmark .logo-svg { width: 2.25rem; height: 2.25rem; flex-shrink: 0; }
+  .wordmark .wordmark-text { display: flex; flex-direction: column; line-height: 1; }
+  .wordmark .wordmark-name { font-size: 0.95rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.15em; }
+  .wordmark .wordmark-tag { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.2em; opacity: 0.6; margin-top: 0.3rem; font-weight: 500; }
+`
+
 // hashCache memoizes file SHA-256 + size, keyed by absolute path and
 // invalidated when size or mtime change. Avoids rehashing every scan tick.
 type hashCache struct {
@@ -490,116 +552,95 @@ func (s *Server) serveSetupWizard(w http.ResponseWriter, r *http.Request) {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Welcome to Mayberry</title>
+`+brandFontLinks+`
 <style>
-  *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
-  :root {
-    --brown-900: #3B2314;
-    --brown-800: #4A3728;
-    --brown-600: #8A7968;
-    --brown-400: #C4A882;
-    --brown-300: #D4A574;
-    --brown-100: #F5F1EB;
-    --brown-50:  #FAF8F5;
-    --green-500: #66BB6A;
-    --red-500:   #EF5350;
-    --shadow-sm: 0 1px 2px rgba(59,35,20,0.06);
-    --shadow-md: 0 4px 12px rgba(59,35,20,0.08);
-    --shadow-lg: 0 8px 30px rgba(59,35,20,0.12);
-    --radius: 12px;
-  }
-  body {
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-    background: linear-gradient(135deg, var(--brown-100) 0%%, #E8E0D4 100%%);
-    color: var(--brown-900);
-    min-height: 100vh;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    padding: 2rem;
-  }
+`+brandCSSTokens+`
+  body { display: flex; align-items: center; justify-content: center; padding: 2rem; }
   .wizard-card {
-    background: white;
-    border-radius: 16px;
-    box-shadow: var(--shadow-lg);
+    background: hsl(var(--card));
+    border-radius: calc(var(--radius) * 2);
+    box-shadow: var(--shadow-stack);
     max-width: 520px;
     width: 100%%;
     padding: 2.5rem;
     animation: fadeUp 0.5s ease-out;
   }
-  @keyframes fadeUp {
-    from { opacity: 0; transform: translateY(20px); }
-    to { opacity: 1; transform: translateY(0); }
-  }
-  .logo {
-    font-size: 2.5rem;
-    margin-bottom: 0.25rem;
-  }
+  @keyframes fadeUp { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: translateY(0); } }
+  .wizard-card .brand { color: hsl(var(--primary)); margin-bottom: 1.5rem; }
   .wizard-card h1 {
-    font-size: 1.6rem;
-    color: var(--brown-800);
-    margin-bottom: 0.25rem;
-    font-weight: 700;
+    font-size: 1.8rem;
+    color: hsl(var(--foreground));
+    margin-bottom: 0.4rem;
   }
   .wizard-card .subtitle {
-    color: var(--brown-600);
+    color: hsl(var(--muted-foreground));
     font-size: 0.95rem;
     margin-bottom: 2rem;
-    line-height: 1.5;
+    line-height: 1.55;
   }
   .form-group { margin-bottom: 1.5rem; }
   .form-group label {
     display: block;
     font-weight: 600;
-    font-size: 0.85rem;
-    color: var(--brown-800);
+    font-size: 0.78rem;
+    color: hsl(var(--foreground));
     margin-bottom: 0.4rem;
-    letter-spacing: 0.02em;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
   }
   .form-group .hint {
-    font-size: 0.78rem;
-    color: var(--brown-600);
-    margin-bottom: 0.4rem;
+    font-size: 0.82rem;
+    color: hsl(var(--muted-foreground));
+    margin-bottom: 0.5rem;
+    line-height: 1.45;
   }
   .form-group input[type="text"] {
     width: 100%%;
     padding: 0.7rem 0.9rem;
-    border: 1.5px solid #DDD5CA;
-    border-radius: 8px;
+    border: 1px solid hsl(var(--input));
+    border-radius: var(--radius);
     font-size: 0.95rem;
-    color: var(--brown-900);
-    background: var(--brown-50);
+    font-family: var(--font-sans);
+    color: hsl(var(--foreground));
+    background: hsl(var(--card));
     transition: border-color 0.2s, box-shadow 0.2s;
     outline: none;
   }
   .form-group input[type="text"]:focus {
-    border-color: var(--brown-400);
-    box-shadow: 0 0 0 3px rgba(196,168,130,0.2);
+    border-color: hsl(var(--primary));
+    box-shadow: 0 0 0 3px hsl(var(--primary) / 0.15);
   }
   .btn-primary {
     width: 100%%;
-    padding: 0.8rem 1.5rem;
-    background: linear-gradient(135deg, var(--brown-800), var(--brown-900));
-    color: white;
+    padding: 0.85rem 1.5rem;
+    background: hsl(var(--primary));
+    color: hsl(var(--primary-foreground));
     border: none;
-    border-radius: 8px;
-    font-size: 1rem;
+    border-radius: var(--radius);
+    font-size: 0.95rem;
     font-weight: 600;
     cursor: pointer;
-    transition: transform 0.15s, box-shadow 0.15s;
+    transition: background-color 0.15s, transform 0.15s, box-shadow 0.15s;
     letter-spacing: 0.02em;
   }
-  .btn-primary:hover { transform: translateY(-1px); box-shadow: var(--shadow-md); }
+  .btn-primary:hover { background: hsl(var(--primary) / 0.92); transform: translateY(-1px); box-shadow: var(--shadow-md); }
   .btn-primary:active { transform: translateY(0); }
   .btn-primary:disabled { opacity: 0.6; cursor: not-allowed; transform: none; }
-  .alert { padding: 0.75rem 1rem; border-radius: 8px; font-size: 0.85rem; margin-bottom: 1rem; display: none; }
-  .alert-error { background: #FFF0F0; color: var(--red-500); border: 1px solid #FFD5D5; }
-  .alert-success { background: #F0FFF0; color: #2E7D32; border: 1px solid #C8E6C9; }
-  .powered-by { text-align: center; margin-top: 1.5rem; font-size: 0.75rem; color: var(--brown-600); }
+  .alert { padding: 0.75rem 1rem; border-radius: var(--radius); font-size: 0.85rem; margin-bottom: 1rem; display: none; }
+  .alert-error { background: hsl(var(--destructive) / 0.08); color: hsl(var(--destructive)); border: 1px solid hsl(var(--destructive) / 0.2); }
+  .alert-success { background: hsl(var(--success) / 0.1); color: hsl(var(--success)); border: 1px solid hsl(var(--success) / 0.2); }
+  .powered-by { text-align: center; margin-top: 1.5rem; font-size: 0.7rem; color: hsl(var(--muted-foreground)); text-transform: uppercase; letter-spacing: 0.15em; font-family: var(--font-mono); }
 </style>
 </head>
 <body>
 <div class="wizard-card">
-  <div class="logo">📚</div>
+  <div class="brand wordmark">
+    <span class="logo-svg">`+mayberryLogoSVG+`</span>
+    <span class="wordmark-text">
+      <span class="wordmark-name">Mayberry</span>
+      <span class="wordmark-tag">Public Library</span>
+    </span>
+  </div>
   <h1>Welcome to Mayberry</h1>
   <p class="subtitle">Let's set up your Branch — your personal EPUB library node in the Mayberry network.</p>
 
@@ -610,7 +651,7 @@ func (s *Server) serveSetupWizard(w http.ResponseWriter, r *http.Request) {
       <label for="display_name">Branch Name</label>
       <div class="hint">A friendly name for your branch (e.g., "Jane's Library"). This determines your public URL.</div>
       <input type="text" id="display_name" name="display_name" placeholder="%s" value="%s">
-      <div class="slug" id="slug-preview" style="font-size:0.78rem;color:#C4A882;margin-top:0.3rem;font-family:monospace">%s.branch.pub</div>
+      <div class="slug mono" id="slug-preview" style="font-size:0.78rem;color:hsl(var(--primary) / 0.7);margin-top:0.4rem">%s.branch.pub</div>
     </div>
     <div class="form-group">
       <label>EPUB Library Folder</label>
@@ -620,7 +661,7 @@ func (s *Server) serveSetupWizard(w http.ResponseWriter, r *http.Request) {
       <div id="library_path-picker" class="picker"></div>
     </div>
     <div class="form-group">
-      <label>Audiobook Folder <span style="font-weight:400;color:var(--brown-600);">(optional)</span></label>
+      <label>Audiobook Folder <span style="font-weight:400;color:hsl(var(--muted-foreground));text-transform:none;letter-spacing:0">(optional)</span></label>
       <div class="hint">Folder containing your .m4b audiobooks. Leave blank to skip — you can add this later in Settings.</div>
       <div id="audiobook_path-selected" class="picker-selected" style="display:none"></div>
       <input type="hidden" id="audiobook_path" name="audiobook_path">
@@ -631,17 +672,20 @@ func (s *Server) serveSetupWizard(w http.ResponseWriter, r *http.Request) {
   <div class="powered-by">Powered by the Mayberry Network</div>
 </div>
 <style>
-  .picker { border:1.5px solid #DDD5CA; border-radius:8px; background:var(--brown-50); max-height:260px; overflow-y:auto; }
-  .picker-row { display:flex; align-items:center; padding:0.45rem 0.75rem; cursor:pointer; border-bottom:1px solid #F0EBE3; font-size:0.88rem; gap:0.5rem; }
+  .picker { border:1px solid hsl(var(--input)); border-radius:var(--radius); background:hsl(var(--card)); max-height:260px; overflow-y:auto; box-shadow: var(--shadow-inset); }
+  .picker-row { display:flex; align-items:center; padding:0.5rem 0.75rem; cursor:pointer; border-bottom:1px solid hsl(var(--border) / 0.06); font-size:0.88rem; gap:0.5rem; transition: background-color 0.1s; }
   .picker-row:last-child { border-bottom:none; }
-  .picker-row:hover { background:#EDE8DF; }
-  .picker-row .icon { flex-shrink:0; width:20px; text-align:center; }
-  .picker-row .name { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--brown-900); }
-  .picker-current { padding:0.5rem 0.75rem; font-size:0.78rem; color:var(--brown-600); border-bottom:1.5px solid #DDD5CA; font-family:monospace; display:flex; align-items:center; justify-content:space-between; }
-  .picker-current .select-btn { background:var(--brown-800); color:white; border:none; border-radius:6px; padding:0.3rem 0.75rem; font-size:0.75rem; cursor:pointer; font-weight:600; }
-  .picker-current .select-btn:hover { background:var(--brown-900); }
-  .picker-selected { padding:0.6rem 0.9rem; background:var(--brown-50); border:1.5px solid #C4A882; border-radius:8px; font-family:monospace; font-size:0.88rem; color:var(--brown-800); margin-bottom:0.5rem; display:flex; align-items:center; justify-content:space-between; }
-  .picker-selected .change-btn { background:none; border:1px solid var(--brown-400); border-radius:6px; padding:0.2rem 0.6rem; font-size:0.75rem; cursor:pointer; color:var(--brown-600); }
+  .picker-row:hover { background:hsl(var(--muted)); }
+  .picker-row .icon { flex-shrink:0; width:20px; text-align:center; color: hsl(var(--muted-foreground)); }
+  .picker-row .name { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:hsl(var(--foreground)); }
+  .picker-current { padding:0.55rem 0.75rem; font-size:0.78rem; color:hsl(var(--muted-foreground)); border-bottom:1px solid hsl(var(--border) / 0.08); font-family:var(--font-mono); display:flex; align-items:center; justify-content:space-between; gap:0.5rem; background: hsl(var(--muted) / 0.5); }
+  .picker-current span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .picker-current .select-btn { background:hsl(var(--primary)); color:hsl(var(--primary-foreground)); border:none; border-radius:calc(var(--radius) - 2px); padding:0.3rem 0.7rem; font-size:0.7rem; cursor:pointer; font-weight:600; text-transform:uppercase; letter-spacing:0.05em; flex-shrink:0; font-family:var(--font-sans); }
+  .picker-current .select-btn:hover { background:hsl(var(--primary) / 0.9); }
+  .picker-selected { padding:0.65rem 0.9rem; background:hsl(var(--muted) / 0.5); border:1px solid hsl(var(--primary) / 0.3); border-radius:var(--radius); font-family:var(--font-mono); font-size:0.85rem; color:hsl(var(--foreground)); margin-bottom:0.5rem; display:flex; align-items:center; justify-content:space-between; gap:0.5rem; }
+  .picker-selected > span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .picker-selected .change-btn { background:transparent; border:1px solid hsl(var(--border) / 0.15); border-radius:calc(var(--radius) - 2px); padding:0.25rem 0.6rem; font-size:0.7rem; cursor:pointer; color:hsl(var(--muted-foreground)); text-transform:uppercase; letter-spacing:0.05em; flex-shrink:0; font-family:var(--font-sans); transition: border-color 0.15s, color 0.15s; }
+  .picker-selected .change-btn:hover { border-color:hsl(var(--primary)); color:hsl(var(--primary)); }
 </style>
 <script>
 async function loadDir(field, path) {
@@ -737,35 +781,14 @@ func (s *Server) serveDashboard(w http.ResponseWriter, r *http.Request) {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>%s — Mayberry Branch</title>
+`+brandFontLinks+`
 <style>
-  *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
-  :root {
-    --brown-900: #3B2314;
-    --brown-800: #4A3728;
-    --brown-700: #5C4A38;
-    --brown-600: #8A7968;
-    --brown-400: #C4A882;
-    --brown-300: #D4A574;
-    --brown-200: #E8D5BC;
-    --brown-100: #F5F1EB;
-    --brown-50:  #FAF8F5;
-    --green-500: #66BB6A;
-    --shadow-sm: 0 1px 2px rgba(59,35,20,0.06);
-    --shadow-md: 0 4px 12px rgba(59,35,20,0.08);
-    --shadow-lg: 0 8px 30px rgba(59,35,20,0.12);
-    --radius: 12px;
-  }
-  body {
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-    background: linear-gradient(180deg, var(--brown-100) 0%%, var(--brown-50) 100%%);
-    color: var(--brown-900);
-    min-height: 100vh;
-  }
+`+brandCSSTokens+`
   .header {
-    background: linear-gradient(135deg, var(--brown-800), var(--brown-900));
-    color: white;
-    padding: 1.5rem 2rem;
-    box-shadow: var(--shadow-lg);
+    background: hsl(var(--primary));
+    color: hsl(var(--primary-foreground));
+    padding: 1.25rem 2rem;
+    box-shadow: var(--shadow-sm);
   }
   .header-inner {
     max-width: 960px;
@@ -773,144 +796,159 @@ func (s *Server) serveDashboard(w http.ResponseWriter, r *http.Request) {
     display: flex;
     align-items: center;
     justify-content: space-between;
+    gap: 1rem;
   }
-  .header h1 {
-    font-size: 1.4rem;
-    font-weight: 700;
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-  }
-  .header .subdomain {
-    font-size: 0.8rem;
-    opacity: 0.7;
-    font-weight: 400;
-  }
+  .header .wordmark { color: hsl(var(--primary-foreground)); }
+  .header .wordmark .wordmark-tag { color: hsl(var(--primary-foreground) / 0.55); }
+  .header-actions { display: flex; align-items: center; gap: 0.75rem; }
   .badge {
     display: inline-flex;
     align-items: center;
-    gap: 0.35rem;
-    background: rgba(255,255,255,0.15);
-    padding: 0.3rem 0.7rem;
-    border-radius: 20px;
-    font-size: 0.75rem;
+    gap: 0.45rem;
+    background: hsl(var(--primary-foreground) / 0.12);
+    padding: 0.3rem 0.75rem;
+    border-radius: 999px;
+    font-size: 0.72rem;
     font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    font-family: var(--font-mono);
   }
-  .badge .dot { width: 8px; height: 8px; border-radius: 50%%; background: var(--green-500); animation: pulse 2s infinite; }
-  @keyframes pulse { 0%%,100%% { opacity: 1; } 50%% { opacity: 0.5; } }
-  .container { max-width: 960px; margin: 0 auto; padding: 1.5rem 2rem; }
+  .badge .dot { width: 7px; height: 7px; border-radius: 50%%; background: hsl(var(--success) / 0.95); box-shadow: 0 0 0 3px hsl(var(--success) / 0.18); animation: pulse 2s infinite; }
+  @keyframes pulse { 0%%,100%% { opacity: 1; } 50%% { opacity: 0.6; } }
+  .icon-link { color: hsl(var(--primary-foreground) / 0.65); text-decoration: none; display: inline-flex; align-items: center; justify-content: center; width: 2rem; height: 2rem; border-radius: var(--radius); transition: background-color 0.15s, color 0.15s; }
+  .icon-link:hover { color: hsl(var(--primary-foreground)); background: hsl(var(--primary-foreground) / 0.1); }
+  .branch-name { padding: 1.75rem 2rem 0; max-width: 960px; margin: 0 auto; }
+  .branch-name h2 { font-size: 1.6rem; color: hsl(var(--foreground)); margin-bottom: 0.2rem; }
+  .branch-name .subdomain { font-family: var(--font-mono); font-size: 0.85rem; color: hsl(var(--muted-foreground)); }
+  .container { max-width: 960px; margin: 0 auto; padding: 1.5rem 2rem 2.5rem; }
   .stats-grid {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
     gap: 1rem;
-    margin-bottom: 1.5rem;
+    margin-bottom: 2rem;
   }
   .stat-card {
-    background: white;
+    background: hsl(var(--card));
     border-radius: var(--radius);
-    padding: 1.25rem 1.5rem;
+    padding: 1.25rem 1.4rem;
     box-shadow: var(--shadow-sm);
-    border: 1px solid rgba(196,168,130,0.2);
+    border: 1px solid hsl(var(--border) / 0.06);
     transition: transform 0.15s, box-shadow 0.15s;
   }
   .stat-card:hover { transform: translateY(-2px); box-shadow: var(--shadow-md); }
   .stat-card .stat-num {
-    font-size: 2rem;
-    font-weight: 800;
-    color: var(--brown-800);
+    font-family: var(--font-serif);
+    font-size: 2.2rem;
+    font-weight: 600;
+    color: hsl(var(--primary));
     line-height: 1;
   }
   .stat-card .stat-label {
-    font-size: 0.78rem;
-    color: var(--brown-600);
-    font-weight: 500;
-    margin-top: 0.25rem;
+    font-size: 0.7rem;
+    color: hsl(var(--muted-foreground));
+    font-weight: 600;
+    margin-top: 0.5rem;
     text-transform: uppercase;
-    letter-spacing: 0.05em;
+    letter-spacing: 0.12em;
+    font-family: var(--font-mono);
   }
   .section { margin-bottom: 1.5rem; }
   .section-title {
-    font-size: 0.85rem;
-    font-weight: 700;
-    color: var(--brown-600);
+    font-size: 0.7rem;
+    font-weight: 600;
+    color: hsl(var(--muted-foreground));
     text-transform: uppercase;
-    letter-spacing: 0.08em;
-    margin-bottom: 0.75rem;
-    padding-bottom: 0.5rem;
-    border-bottom: 2px solid var(--brown-200);
+    letter-spacing: 0.15em;
+    margin-bottom: 1rem;
+    padding-bottom: 0.6rem;
+    border-bottom: 1px solid hsl(var(--border) / 0.08);
+    font-family: var(--font-mono);
   }
   .book-list { list-style: none; }
   .book-item {
-    background: white;
-    border-radius: 10px;
-    padding: 0.9rem 1.2rem;
-    margin-bottom: 0.5rem;
+    background: hsl(var(--card));
+    border-radius: var(--radius);
+    padding: 0.85rem 1.1rem;
+    margin-bottom: 0.55rem;
     box-shadow: var(--shadow-sm);
-    border: 1px solid rgba(196,168,130,0.15);
+    border: 1px solid hsl(var(--border) / 0.06);
     display: flex;
     align-items: center;
     gap: 1rem;
     transition: transform 0.1s, box-shadow 0.1s;
   }
-  .book-item:hover { transform: translateX(4px); box-shadow: var(--shadow-md); }
+  .book-item:hover { transform: translateX(3px); box-shadow: var(--shadow-md); }
   .book-icon {
     width: 40px;
     height: 56px;
-    background: var(--brown-100);
+    background: hsl(var(--muted));
+    color: hsl(var(--primary) / 0.7);
     border-radius: 4px;
     display: flex;
     align-items: center;
     justify-content: center;
-    font-size: 1.1rem;
     flex-shrink: 0;
   }
+  .book-icon svg { width: 22px; height: 22px; }
   .book-cover {
     width: 40px;
     height: 56px;
     object-fit: cover;
     border-radius: 4px;
     flex-shrink: 0;
-    box-shadow: 0 1px 3px rgba(59,35,20,0.15);
+    box-shadow: 0 1px 3px rgba(0,0,0,0.1);
   }
   .book-info { flex: 1; min-width: 0; }
-  .book-title { font-weight: 600; font-size: 0.95rem; color: var(--brown-900); }
-  .book-meta { color: var(--brown-600); font-size: 0.8rem; margin-top: 0.15rem; }
+  .book-title { font-weight: 600; font-size: 0.95rem; color: hsl(var(--foreground)); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .book-meta { color: hsl(var(--muted-foreground)); font-size: 0.82rem; margin-top: 0.15rem; }
   .isbn-badge {
     font-size: 0.7rem;
-    background: var(--brown-100);
-    color: var(--brown-700);
-    padding: 0.15rem 0.5rem;
-    border-radius: 4px;
-    font-family: "SF Mono", "Fira Code", monospace;
+    background: hsl(var(--muted));
+    color: hsl(var(--muted-foreground));
+    padding: 0.2rem 0.55rem;
+    border-radius: calc(var(--radius) - 2px);
+    font-family: var(--font-mono);
     flex-shrink: 0;
   }
   .empty-state {
     text-align: center;
     padding: 3rem 1rem;
-    color: var(--brown-600);
+    color: hsl(var(--muted-foreground));
   }
-  .empty-state .icon { font-size: 2.5rem; margin-bottom: 0.75rem; }
+  .empty-state .empty-icon { color: hsl(var(--primary) / 0.4); margin-bottom: 0.75rem; display: flex; justify-content: center; }
+  .empty-state .empty-icon svg { width: 48px; height: 48px; }
   .empty-state p { font-size: 0.9rem; }
   .footer {
     text-align: center;
     padding: 1.5rem;
-    color: var(--brown-600);
-    font-size: 0.75rem;
+    color: hsl(var(--muted-foreground));
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    letter-spacing: 0.15em;
+    font-family: var(--font-mono);
   }
 </style>
 </head>
 <body>
 <div class="header">
   <div class="header-inner">
-    <div>
-      <h1>📚 %s</h1>
-      <div class="subdomain">%s</div>
-    </div>
-    <div style="display:flex;align-items:center;gap:0.75rem">
+    <a href="/" class="wordmark">
+      <span class="logo-svg">`+mayberryLogoSVG+`</span>
+      <span class="wordmark-text">
+        <span class="wordmark-name">Mayberry</span>
+        <span class="wordmark-tag">Public Library</span>
+      </span>
+    </a>
+    <div class="header-actions">
       <div class="badge"><span class="dot"></span> Online</div>
-      <a href="/settings" style="color:rgba(255,255,255,0.6);text-decoration:none;font-size:1.2rem" title="Settings">&#9881;</a>
+      <a href="/settings" class="icon-link" title="Settings" aria-label="Settings"><svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg></a>
     </div>
   </div>
+</div>
+<div class="branch-name">
+  <h2>%s</h2>
+  <div class="subdomain">%s</div>
 </div>
 <div class="container">
   <div class="stats-grid">
@@ -928,12 +966,13 @@ func (s *Server) serveDashboard(w http.ResponseWriter, r *http.Request) {
     <ul class="book-list" id="catalog"></ul>
   </div>
 </div>
-<div class="footer">Powered by the Mayberry Network</div>
+<div class="footer">Part of the Mayberry Network</div>
 <script>
+var BOOK_GLYPH = `+"`"+bookGlyphSVG+"`"+`;
 fetch('/api/catalog').then(r=>r.json()).then(books=>{
   const ul=document.getElementById('catalog');
   if(!books||books.length===0){
-    ul.innerHTML='<div class="empty-state"><div class="icon">📖</div><p>No EPUBs found yet. Add .epub files to your library folder.</p></div>';
+    ul.innerHTML='<div class="empty-state"><div class="empty-icon">'+BOOK_GLYPH+'</div><p>No EPUBs found yet. Add .epub files to your library folder.</p></div>';
     return;
   }
   books.forEach(b=>{
@@ -941,7 +980,7 @@ fetch('/api/catalog').then(r=>r.json()).then(books=>{
     li.className='book-item';
     const isbn=b.isbn?'<span class="isbn-badge">'+b.isbn+'</span>':'';
     var coverKey=b.id||b.isbn||encodeURIComponent(b.path.split('/').pop());
-    var img=b.has_cover?'<img src="/covers/'+coverKey+'" class="book-cover" onerror="this.style.display=\'none\';this.nextSibling.style.display=\'flex\'"><div class="book-icon" style="display:none">📕</div>':'<div class="book-icon">📕</div>';
+    var img=b.has_cover?'<img src="/covers/'+coverKey+'" class="book-cover" onerror="this.style.display=\'none\';this.nextSibling.style.display=\'flex\'"><div class="book-icon" style="display:none">'+BOOK_GLYPH+'</div>':'<div class="book-icon">'+BOOK_GLYPH+'</div>';
     li.innerHTML=img+'<div class="book-info"><div class="book-title">'+(b.title||'Unknown Title')+'</div><div class="book-meta">by '+(b.author||'Unknown')+'</div></div>'+isbn;
     ul.appendChild(li);
   });
@@ -1255,65 +1294,74 @@ func (s *Server) handleSettingsPage(w http.ResponseWriter, r *http.Request) {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Settings — Mayberry Branch</title>
+`+brandFontLinks+`
 <style>
-  *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
-  :root {
-    --brown-900: #3B2314; --brown-800: #4A3728; --brown-600: #8A7968;
-    --brown-400: #C4A882; --brown-300: #D4A574; --brown-100: #F5F1EB;
-    --brown-50: #FAF8F5; --green-500: #66BB6A; --red-500: #EF5350;
-    --shadow-lg: 0 8px 30px rgba(59,35,20,0.12); --radius: 12px;
-  }
-  body {
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-    background: linear-gradient(135deg, var(--brown-100) 0%%, #E8E0D4 100%%);
-    color: var(--brown-900); min-height: 100vh;
-    display: flex; align-items: center; justify-content: center; padding: 2rem;
-  }
+`+brandCSSTokens+`
+  body { display: flex; align-items: flex-start; justify-content: center; padding: 2.5rem 1.5rem; }
   .card {
-    background: white; border-radius: 16px; box-shadow: var(--shadow-lg);
-    max-width: 520px; width: 100%%; padding: 2.5rem;
+    background: hsl(var(--card)); border-radius: calc(var(--radius) * 2); box-shadow: var(--shadow-stack);
+    max-width: 560px; width: 100%%; padding: 2.5rem;
   }
-  .card h1 { font-size: 1.6rem; color: var(--brown-800); margin-bottom: 0.25rem; }
-  .subtitle { color: var(--brown-600); font-size: 0.95rem; margin-bottom: 2rem; line-height: 1.5; }
+  .card-header { display: flex; align-items: center; justify-content: space-between; gap: 1rem; margin-bottom: 1.5rem; }
+  .card-header .wordmark { color: hsl(var(--primary)); }
+  .card h1 { font-size: 1.7rem; color: hsl(var(--foreground)); margin-bottom: 0.4rem; }
+  .subtitle { color: hsl(var(--muted-foreground)); font-size: 0.95rem; margin-bottom: 2rem; line-height: 1.55; }
   .form-group { margin-bottom: 1.5rem; }
-  .form-group label { display: block; font-weight: 600; font-size: 0.85rem; color: var(--brown-800); margin-bottom: 0.4rem; }
-  .form-group .hint { font-size: 0.78rem; color: var(--brown-600); margin-bottom: 0.4rem; }
-  .form-group .slug { font-size: 0.78rem; color: var(--brown-400); margin-top: 0.3rem; font-family: monospace; }
+  .form-group label { display: block; font-weight: 600; font-size: 0.78rem; color: hsl(var(--foreground)); margin-bottom: 0.4rem; text-transform: uppercase; letter-spacing: 0.08em; }
+  .form-group .hint { font-size: 0.82rem; color: hsl(var(--muted-foreground)); margin-bottom: 0.5rem; line-height: 1.45; }
+  .form-group .slug { font-size: 0.78rem; color: hsl(var(--primary) / 0.7); margin-top: 0.4rem; font-family: var(--font-mono); }
   .form-group input[type="text"] {
-    width: 100%%; padding: 0.7rem 0.9rem; border: 1.5px solid #DDD5CA; border-radius: 8px;
-    font-size: 0.95rem; color: var(--brown-900); background: var(--brown-50);
+    width: 100%%; padding: 0.7rem 0.9rem; border: 1px solid hsl(var(--input)); border-radius: var(--radius);
+    font-size: 0.95rem; font-family: var(--font-sans); color: hsl(var(--foreground)); background: hsl(var(--card));
     transition: border-color 0.2s, box-shadow 0.2s; outline: none;
   }
-  .form-group input[type="text"]:focus { border-color: var(--brown-400); box-shadow: 0 0 0 3px rgba(196,168,130,0.2); }
+  .form-group input[type="text"]:focus { border-color: hsl(var(--primary)); box-shadow: 0 0 0 3px hsl(var(--primary) / 0.15); }
   .btn-primary {
-    width: 100%%; padding: 0.8rem 1.5rem;
-    background: linear-gradient(135deg, var(--brown-800), var(--brown-900));
-    color: white; border: none; border-radius: 8px; font-size: 1rem; font-weight: 600;
-    cursor: pointer; transition: transform 0.15s, box-shadow 0.15s;
+    width: 100%%; padding: 0.85rem 1.5rem;
+    background: hsl(var(--primary)); color: hsl(var(--primary-foreground));
+    border: none; border-radius: var(--radius); font-size: 0.95rem; font-weight: 600;
+    cursor: pointer; transition: background-color 0.15s, transform 0.15s, box-shadow 0.15s;
+    letter-spacing: 0.02em; font-family: var(--font-sans);
   }
-  .btn-primary:hover { transform: translateY(-1px); box-shadow: 0 4px 12px rgba(59,35,20,0.08); }
+  .btn-primary:hover { background: hsl(var(--primary) / 0.92); transform: translateY(-1px); box-shadow: var(--shadow-md); }
   .btn-primary:disabled { opacity: 0.6; cursor: not-allowed; transform: none; }
-  .alert { padding: 0.75rem 1rem; border-radius: 8px; font-size: 0.85rem; margin-bottom: 1rem; display: none; }
-  .alert-error { background: #FFF0F0; color: var(--red-500); border: 1px solid #FFD5D5; }
-  .alert-success { background: #F0FFF0; color: #2E7D32; border: 1px solid #C8E6C9; }
-  .back { display: inline-block; margin-bottom: 1rem; color: var(--brown-600); text-decoration: none; font-size: 0.85rem; }
-  .back:hover { color: var(--brown-800); }
-  .picker { border:1.5px solid #DDD5CA; border-radius:8px; background:var(--brown-50); max-height:260px; overflow-y:auto; }
-  .picker-row { display:flex; align-items:center; padding:0.45rem 0.75rem; cursor:pointer; border-bottom:1px solid #F0EBE3; font-size:0.88rem; gap:0.5rem; }
+  .btn-accent {
+    background: hsl(var(--accent)); color: hsl(var(--accent-foreground));
+  }
+  .btn-accent:hover { background: hsl(var(--accent) / 0.9); }
+  .alert { padding: 0.75rem 1rem; border-radius: var(--radius); font-size: 0.85rem; margin-bottom: 1rem; display: none; }
+  .alert-error { background: hsl(var(--destructive) / 0.08); color: hsl(var(--destructive)); border: 1px solid hsl(var(--destructive) / 0.2); }
+  .alert-success { background: hsl(var(--success) / 0.1); color: hsl(var(--success)); border: 1px solid hsl(var(--success) / 0.2); }
+  .back { display: inline-flex; align-items: center; gap: 0.4rem; color: hsl(var(--muted-foreground)); text-decoration: none; font-size: 0.82rem; transition: color 0.15s; }
+  .back:hover { color: hsl(var(--primary)); }
+  .picker { border:1px solid hsl(var(--input)); border-radius:var(--radius); background:hsl(var(--card)); max-height:260px; overflow-y:auto; box-shadow: var(--shadow-inset); }
+  .picker-row { display:flex; align-items:center; padding:0.5rem 0.75rem; cursor:pointer; border-bottom:1px solid hsl(var(--border) / 0.06); font-size:0.88rem; gap:0.5rem; transition: background-color 0.1s; }
   .picker-row:last-child { border-bottom:none; }
-  .picker-row:hover { background:#EDE8DF; }
-  .picker-row .icon { flex-shrink:0; width:20px; text-align:center; }
-  .picker-row .name { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:var(--brown-900); }
-  .picker-current { padding:0.5rem 0.75rem; font-size:0.78rem; color:var(--brown-600); border-bottom:1.5px solid #DDD5CA; font-family:monospace; display:flex; align-items:center; justify-content:space-between; }
-  .picker-current .select-btn { background:var(--brown-800); color:white; border:none; border-radius:6px; padding:0.3rem 0.75rem; font-size:0.75rem; cursor:pointer; font-weight:600; }
-  .picker-current .select-btn:hover { background:var(--brown-900); }
-  .picker-selected { padding:0.6rem 0.9rem; background:var(--brown-50); border:1.5px solid #C4A882; border-radius:8px; font-family:monospace; font-size:0.88rem; color:var(--brown-800); display:flex; align-items:center; justify-content:space-between; }
-  .picker-selected .change-btn { background:none; border:1px solid var(--brown-400); border-radius:6px; padding:0.2rem 0.6rem; font-size:0.75rem; cursor:pointer; color:var(--brown-600); }
+  .picker-row:hover { background:hsl(var(--muted)); }
+  .picker-row .icon { flex-shrink:0; width:20px; text-align:center; color: hsl(var(--muted-foreground)); }
+  .picker-row .name { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:hsl(var(--foreground)); }
+  .picker-current { padding:0.55rem 0.75rem; font-size:0.78rem; color:hsl(var(--muted-foreground)); border-bottom:1px solid hsl(var(--border) / 0.08); font-family:var(--font-mono); display:flex; align-items:center; justify-content:space-between; gap:0.5rem; background: hsl(var(--muted) / 0.5); }
+  .picker-current span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .picker-current .select-btn { background:hsl(var(--primary)); color:hsl(var(--primary-foreground)); border:none; border-radius:calc(var(--radius) - 2px); padding:0.3rem 0.7rem; font-size:0.7rem; cursor:pointer; font-weight:600; text-transform:uppercase; letter-spacing:0.05em; flex-shrink:0; font-family:var(--font-sans); }
+  .picker-current .select-btn:hover { background:hsl(var(--primary) / 0.9); }
+  .picker-selected { padding:0.65rem 0.9rem; background:hsl(var(--muted) / 0.5); border:1px solid hsl(var(--primary) / 0.3); border-radius:var(--radius); font-family:var(--font-mono); font-size:0.85rem; color:hsl(var(--foreground)); display:flex; align-items:center; justify-content:space-between; gap:0.5rem; }
+  .picker-selected > span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .picker-selected .change-btn { background:transparent; border:1px solid hsl(var(--border) / 0.15); border-radius:calc(var(--radius) - 2px); padding:0.25rem 0.6rem; font-size:0.7rem; cursor:pointer; color:hsl(var(--muted-foreground)); text-transform:uppercase; letter-spacing:0.05em; flex-shrink:0; font-family:var(--font-sans); transition: border-color 0.15s, color 0.15s; }
+  .picker-selected .change-btn:hover { border-color:hsl(var(--primary)); color:hsl(var(--primary)); }
 </style>
 </head>
 <body>
 <div class="card">
-  <a href="/" class="back">&larr; Back to Dashboard</a>
+  <div class="card-header">
+    <a href="/" class="back">&larr; Back to Dashboard</a>
+    <div class="wordmark">
+      <span class="logo-svg" style="width:1.6rem;height:1.6rem">`+mayberryLogoSVG+`</span>
+      <span class="wordmark-text">
+        <span class="wordmark-name" style="font-size:0.78rem">Mayberry</span>
+        <span class="wordmark-tag" style="font-size:0.58rem">Public Library</span>
+      </span>
+    </div>
+  </div>
   <h1>Branch Settings</h1>
   <p class="subtitle">Update your branch name or library folder. Changes take effect immediately.</p>
 
@@ -1334,7 +1382,7 @@ func (s *Server) handleSettingsPage(w http.ResponseWriter, r *http.Request) {
       <div id="library_path-picker" class="picker" style="%s"></div>
     </div>
     <div class="form-group">
-      <label>Audiobook Folder <span style="font-weight:400;color:var(--brown-600);">(optional)</span></label>
+      <label>Audiobook Folder <span style="font-weight:400;color:hsl(var(--muted-foreground));text-transform:none;letter-spacing:0">(optional)</span></label>
       <div class="hint">Folder containing your .m4b audiobooks. Leave blank to skip audiobook sync. Subfolders are scanned recursively.</div>
       <div id="audiobook_path-selected" class="picker-selected" style="%s"><span>%s</span><button type="button" class="change-btn" onclick="changeFolder('audiobook_path')">Change</button><button type="button" class="change-btn" style="margin-left:0.4rem;" onclick="clearFolder('audiobook_path')">Clear</button></div>
       <input type="hidden" id="audiobook_path" name="audiobook_path" value="%s">
@@ -1342,7 +1390,7 @@ func (s *Server) handleSettingsPage(w http.ResponseWriter, r *http.Request) {
     </div>
     %s
     <button type="submit" class="btn-primary" id="submit-btn">Save Settings</button>
-    <button type="button" class="btn-primary" id="restart-btn" style="margin-top:0.6rem;display:none;background:linear-gradient(135deg,#C97A4D,#A85D34);" onclick="restartDaemon()">Restart Now to Apply</button>
+    <button type="button" class="btn-primary btn-accent" id="restart-btn" style="margin-top:0.6rem;display:none;" onclick="restartDaemon()">Restart Now to Apply</button>
   </form>
 </div>
 <script>
@@ -1481,12 +1529,12 @@ async function refreshMirrorStatus() {
     ul.innerHTML = '';
     (s.recent_events || []).slice(0, 5).forEach(function(e) {
       var li = document.createElement('li');
-      li.style.padding = '0.2rem 0';
-      var color = e.kind === 'accepted' ? '#3F804E' : '#A04040';
+      li.style.padding = '0.25rem 0';
+      var color = e.kind === 'accepted' ? 'hsl(145 40%% 30%%)' : 'hsl(0 65%% 50%%)';
       var book = e.book_id ? ' ' + e.book_id : '';
       var reason = e.reason ? ' — ' + e.reason : '';
-      li.innerHTML = '<span style="color:' + color + ';font-weight:600">' + e.kind + '</span>' +
-                     book + ' <span style="color:#A0937D">' + relTime(e.at) + '</span>' + reason;
+      li.innerHTML = '<span style="color:' + color + ';font-weight:600;text-transform:uppercase;font-size:0.7rem;letter-spacing:0.08em;font-family:var(--font-mono)">' + e.kind + '</span>' +
+                     book + ' <span style="color:hsl(var(--muted-foreground))">' + relTime(e.at) + '</span>' + reason;
       ul.appendChild(li);
     });
   } catch (err) { /* network blips are fine; next interval retries */ }
@@ -1509,7 +1557,7 @@ document.getElementById('mirror-purge-btn').addEventListener('click', async func
 document.getElementById('mirror_network').addEventListener('change', function() {
   if (!this.checked) return;
   if (localStorage.getItem('mayberry_mirror_disclosure_seen')) return;
-  var ok = confirm('Network mirror notice:\n\nYou will host copies of other branches’ files so the network stays resilient when those branches go offline. Downloads are slow and rate-limited, the mirror respects your size cap, and you can purge everything from this page at any time.\n\nEnable network mirror?');
+  var ok = confirm('Enable network mirror?\n\nThanks for helping keep the network resilient. Here is what happens when you turn this on:\n\n• Your branch slowly backs up the rarest books on Mayberry — the ones held by only one or two branches today.\n• Downloads are bounded by your size cap (default 100 GB) and your speed setting (default ~500 KB/s, one book every 10–15 minutes).\n• Originals always serve readers first. Your mirror only steps in when every original holder is offline.\n• Every file is hash-verified and format-checked before it lands on disk.\n• You can hit "Purge mirror" on this page at any time to clear everything immediately.\n\nWhen others mirror your books, the favor is returned. Enable?');
   if (!ok) { this.checked = false; return; }
   localStorage.setItem('mayberry_mirror_disclosure_seen', '1');
 });
@@ -1548,44 +1596,59 @@ func mirrorSettingsHTML(cfg *config.BranchConfig) string {
 		serve = config.DefaultMirrorServeRate
 	}
 	return fmt.Sprintf(`
-    <div class="form-group" style="margin-top:2rem;padding-top:1.5rem;border-top:1px solid #E8DED0">
-      <div style="display:flex;align-items:center;gap:0.5rem;margin-bottom:0.5rem">
-        <span style="font-size:0.7rem;background:#FFE4C4;color:#8B4513;padding:0.15rem 0.5rem;border-radius:10px;font-weight:600;letter-spacing:0.05em;text-transform:uppercase">Beta</span>
-        <strong style="font-size:0.95rem;color:#4A3728">Network Mirror</strong>
+    <div class="form-group" style="margin-top:2rem;padding-top:1.5rem;border-top:1px solid hsl(var(--border) / 0.08)">
+      <div style="display:flex;align-items:center;gap:0.6rem;margin-bottom:0.6rem">
+        <span style="font-size:0.65rem;background:hsl(var(--accent) / 0.15);color:hsl(var(--accent));padding:0.18rem 0.55rem;border-radius:999px;font-weight:600;letter-spacing:0.12em;text-transform:uppercase;font-family:var(--font-mono)">Beta</span>
+        <strong style="font-size:1rem;color:hsl(var(--foreground));font-family:var(--font-serif);font-weight:600">Network Mirror</strong>
       </div>
-      <div class="hint" style="margin-bottom:1rem">Mirror books from other branches so they remain available if those branches go offline. The download client ships in a later update — for now you can configure preferences.</div>
-      <label style="display:flex;align-items:center;gap:0.5rem;font-size:0.9rem;font-weight:500;margin-bottom:1rem;cursor:pointer">
-        <input type="checkbox" id="mirror_network" %s>
+      <div style="background:hsl(var(--muted) / 0.5);border:1px solid hsl(var(--border) / 0.06);border-radius:var(--radius);padding:1rem 1.1rem;margin-bottom:1rem">
+        <div style="font-size:0.92rem;color:hsl(var(--foreground));line-height:1.55;margin-bottom:0.7rem">
+          <strong>Help keep the Mayberry network resilient.</strong> When a branch goes offline — vacation, power outage, hard drive swap — the books it holds disappear from the catalog. Unless someone has a copy. Enabling mirror means your branch quietly backs up the rarest books on the network so they stay available even when their original branches go dark. When others enable it, your books get the same protection.
+        </div>
+        <details style="font-size:0.82rem;color:hsl(var(--muted-foreground))">
+          <summary style="cursor:pointer;font-weight:600;color:hsl(var(--foreground));padding:0.2rem 0">How it works</summary>
+          <ul style="margin:0.5rem 0 0 1.1rem;padding:0;line-height:1.55">
+            <li><strong>Rarest first.</strong> Town Square ranks every book by how many branches hold it. Your mirror downloads the ones held by only one or two — the books that would actually be lost.</li>
+            <li><strong>Slow and bounded.</strong> One download every 10–15 minutes by default, capped at 500 KB/s, never more than your size limit. It will not compete with anything else your computer is doing.</li>
+            <li><strong>Originals always serve first.</strong> When a reader downloads a book, Town Square sends them to the original holder. Your mirror only takes over when every original is offline.</li>
+            <li><strong>Hash-verified, format-checked.</strong> Every file is verified against a SHA-256 the source advertised, then validated as a real EPUB before it lands on disk. Malformed or tampered files are rejected and logged.</li>
+            <li><strong>Polite to neighbors.</strong> When other branches mirror from you, those requests are throttled and yield to real readers. Your bandwidth stays yours.</li>
+            <li><strong>One click to undo.</strong> The "Purge mirror" button below frees the disk back instantly — no daemon restart, no leftover state.</li>
+          </ul>
+        </details>
+      </div>
+      <label style="display:flex;align-items:center;gap:0.55rem;font-size:0.92rem;font-weight:500;margin-bottom:1.1rem;cursor:pointer;text-transform:none;letter-spacing:0;color:hsl(var(--foreground))">
+        <input type="checkbox" id="mirror_network" style="accent-color:hsl(var(--primary));width:1rem;height:1rem" %s>
         Enable network mirror
       </label>
-      <label for="mirror_size" style="display:block;font-size:0.85rem;font-weight:600;margin-bottom:0.25rem">Mirror size limit</label>
+      <label for="mirror_size">Mirror size limit</label>
       <div class="hint">Maximum disk space to use, e.g. 100G, 50G, 500M.</div>
       <input type="text" id="mirror_size" value="%s" style="margin-bottom:0.9rem">
-      <label for="mirror_only" style="display:block;font-size:0.85rem;font-weight:600;margin-bottom:0.25rem">Only mirror from (optional)</label>
+      <label for="mirror_only">Only mirror from (optional)</label>
       <div class="hint">Comma-separated branch subdomains. Leave empty for "any branch with rare books".</div>
       <input type="text" id="mirror_only" value="%s" placeholder="janes-library, oak-grove" style="margin-bottom:0.9rem">
-      <label for="mirror_ignore" style="display:block;font-size:0.85rem;font-weight:600;margin-bottom:0.25rem">Never mirror from (optional)</label>
+      <label for="mirror_ignore">Never mirror from (optional)</label>
       <div class="hint">Comma-separated branch subdomains to skip.</div>
       <input type="text" id="mirror_ignore" value="%s" style="margin-bottom:0.9rem">
-      <label for="mirror_rate" style="display:block;font-size:0.85rem;font-weight:600;margin-bottom:0.25rem">Mirror speed</label>
+      <label for="mirror_rate">Mirror speed</label>
       <div class="hint">Slow: ~6 books/hr at 500 KB/s. Normal: ~12/hr at 1 MB/s. Fast: ~30/hr at 5 MB/s.</div>
-      <select id="mirror_rate" style="width:100%%;padding:0.7rem 0.9rem;border:1.5px solid #DDD5CA;border-radius:8px;background:#FAF8F5;font-size:0.95rem;color:#3B2314;margin-bottom:0.9rem">
+      <select id="mirror_rate" style="width:100%%;padding:0.7rem 0.9rem;border:1px solid hsl(var(--input));border-radius:var(--radius);background:hsl(var(--card));font-size:0.95rem;color:hsl(var(--foreground));margin-bottom:0.9rem;font-family:var(--font-sans);outline:none;cursor:pointer">
         <option value="slow" %s>Slow</option>
         <option value="normal" %s>Normal</option>
         <option value="fast" %s>Fast</option>
       </select>
-      <label for="mirror_serve_rate" style="display:block;font-size:0.85rem;font-weight:600;margin-bottom:0.25rem">Outbound mirror serve rate</label>
+      <label for="mirror_serve_rate">Outbound mirror serve rate</label>
       <div class="hint">Bandwidth cap when others mirror from your branch, e.g. 200K, 1M.</div>
       <input type="text" id="mirror_serve_rate" value="%s">
 
-      <div id="mirror-status-panel" style="margin-top:1.25rem;padding:0.9rem 1rem;background:#FAF6F0;border:1px solid #E8DCC8;border-radius:8px;display:none">
-        <div style="font-size:0.8rem;font-weight:700;color:#4A3728;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:0.5rem">Mirror status</div>
-        <div id="mirror-usage" style="font-size:0.85rem;color:#5C4A38;margin-bottom:0.4rem"></div>
-        <div id="mirror-last-download" style="font-size:0.82rem;color:#8A7968;margin-bottom:0.75rem"></div>
-        <div style="font-size:0.75rem;font-weight:700;color:#8A7968;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:0.3rem">Recent activity</div>
-        <ul id="mirror-events" style="list-style:none;padding:0;margin:0;font-size:0.78rem;color:#5C4A38"></ul>
+      <div id="mirror-status-panel" style="margin-top:1.25rem;padding:1rem 1.1rem;background:hsl(var(--muted) / 0.5);border:1px solid hsl(var(--border) / 0.06);border-radius:var(--radius);display:none">
+        <div style="font-size:0.7rem;font-weight:600;color:hsl(var(--muted-foreground));text-transform:uppercase;letter-spacing:0.15em;margin-bottom:0.6rem;font-family:var(--font-mono)">Mirror status</div>
+        <div id="mirror-usage" style="font-size:0.88rem;color:hsl(var(--foreground));margin-bottom:0.35rem"></div>
+        <div id="mirror-last-download" style="font-size:0.82rem;color:hsl(var(--muted-foreground));margin-bottom:0.85rem"></div>
+        <div style="font-size:0.65rem;font-weight:600;color:hsl(var(--muted-foreground));text-transform:uppercase;letter-spacing:0.15em;margin-bottom:0.35rem;font-family:var(--font-mono)">Recent activity</div>
+        <ul id="mirror-events" style="list-style:none;padding:0;margin:0;font-size:0.8rem;color:hsl(var(--foreground))"></ul>
       </div>
-      <button type="button" id="mirror-purge-btn" style="margin-top:0.6rem;display:none;background:#C97A4D;color:white;border:none;padding:0.55rem 1rem;border-radius:8px;font-size:0.85rem;font-weight:600;cursor:pointer">Purge mirror</button>
+      <button type="button" id="mirror-purge-btn" style="margin-top:0.7rem;display:none;background:hsl(var(--accent));color:hsl(var(--accent-foreground));border:none;padding:0.55rem 1rem;border-radius:var(--radius);font-size:0.85rem;font-weight:600;cursor:pointer;font-family:var(--font-sans);transition:background-color 0.15s">Purge mirror</button>
     </div>`, checked, size, only, ignore, sel("slow"), sel("normal"), sel("fast"), serve)
 }
 
@@ -1623,7 +1686,10 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleFavicon(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "image/svg+xml")
-	w.Write([]byte(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><text y="80" font-size="80">📚</text></svg>`))
+	// Same brand mark as the dashboard wordmark, in forest green so it
+	// reads on light browser tabs. fill is hardcoded (not currentColor)
+	// because favicons render outside our document's color context.
+	w.Write([]byte(strings.Replace(mayberryLogoSVG, `fill="currentColor"`, `fill="#266142"`, 1)))
 }
 
 // --- Covers ---
