@@ -333,11 +333,6 @@ func startFullServices(ctx context.Context, cfg *config.BranchConfig, hubURL str
 			cfg.DisplayName = updated.DisplayName
 			cfg.Subdomain = updated.Subdomain
 		})
-		branchSrv.SetRestartCallback(func() {
-			alog.Add("Restart requested from settings")
-			log.Printf("branch: restart requested from settings")
-			scheduleRestart()
-		})
 		swap.Set(branchSrv)
 		state.setStatus("townsquare", "connected")
 		alog.Add(fmt.Sprintf("Registered with Town Square (id: %s)", branchID))
@@ -345,6 +340,17 @@ func startFullServices(ctx context.Context, cfg *config.BranchConfig, hubURL str
 		state.setStatus("townsquare", "error")
 		alog.Add("Town Square registration failed")
 	}
+
+	// Restart callback is local-only — it doesn't need branchID or a
+	// successful registration. Set it on whichever Server is now being
+	// served (the new one if register succeeded, the initial one if not),
+	// so a transient TS outage at boot doesn't permanently disable the
+	// restart button until the next process start.
+	branchSrv.SetRestartCallback(func() {
+		alog.Add("Restart requested from settings")
+		log.Printf("branch: restart requested from settings")
+		scheduleRestart()
+	})
 
 	// Fetch Town Square public key
 	go func() {
@@ -839,34 +845,81 @@ func main() {
 		}
 	}
 
-	// Already configured (or just finished setup) — install as background service.
+	// Already configured (or just finished setup) — get a daemon running
+	// without keeping this terminal tied up. Preferred path: register a
+	// service via launchd/systemd/registry. If that succeeds AND the
+	// service actually starts serving localhost, we're done. Otherwise we
+	// fall through to spawning a detached child running `--daemon`, so the
+	// user can close their terminal either way.
 	fmt.Println()
 	fmt.Printf("  📚 Mayberry Branch — %s\n", cfg.DisplayName)
 	fmt.Println()
-	fmt.Println("  Installing as a background service...")
 
 	if err := serviceInstall(); err != nil {
-		// Fallback: run in foreground.
-		fmt.Printf("  Could not install service: %v\n", err)
-		fmt.Println("  Running in foreground instead.")
-		fmt.Println()
-
-		state := newSharedState()
-		alog := newActivityLog(100)
-		setupDone := make(chan struct{})
-		go startBackgroundServices(sigCtx, cfg, *hubURL, state, alog, setupDone)
-
-		// Wait for services to connect, then print status.
-		time.Sleep(3 * time.Second)
+		fmt.Printf("  Could not install as service: %v\n", err)
+	} else if waitForLocalDaemon(cfg.Port, 5*time.Second) {
 		printStatus(cfg)
-		<-sigCtx.Done()
-		fmt.Println("\nShutting down...")
 		return
+	} else {
+		fmt.Println("  Service installed but didn't respond — starting detached.")
 	}
 
-	// Service installed — it runs independently. Give it a moment to start.
-	time.Sleep(2 * time.Second)
+	// Spawn a detached child running `--daemon` and exit. The child is
+	// session-detached so closing the terminal doesn't take it down.
+	if err := spawnDetachedDaemon(); err != nil {
+		fmt.Printf("  Could not start detached daemon: %v\n", err)
+		fmt.Println("  Run `mayberry --daemon` manually to start the daemon in this terminal.")
+		return
+	}
+	if !waitForLocalDaemon(cfg.Port, 8*time.Second) {
+		fmt.Printf("  Daemon did not respond on port %d within 8s. Check `mayberry --daemon` output for errors.\n", cfg.Port)
+		return
+	}
 	printStatus(cfg)
+}
+
+// waitForLocalDaemon polls http://localhost:{port}/api/status until it gets a
+// successful response or the timeout elapses. Used after installing/starting
+// the background daemon to verify it actually came up before we exit.
+func waitForLocalDaemon(port int, timeout time.Duration) bool {
+	client := &http.Client{Timeout: 500 * time.Millisecond}
+	url := fmt.Sprintf("http://127.0.0.1:%d/api/status", port)
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		resp, err := client.Get(url)
+		if err == nil {
+			resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				return true
+			}
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	return false
+}
+
+// spawnDetachedDaemon launches a separate copy of this binary with `--daemon`
+// in a process that's fully detached from the current terminal. Stdio is
+// redirected to /dev/null (or its Windows equivalent) so the child can survive
+// the parent's exit. On Unix this uses setsid via SysProcAttr; on Windows it
+// uses DETACHED_PROCESS + CREATE_NEW_PROCESS_GROUP. See detach_unix.go and
+// detach_windows.go for the platform-specific bits.
+func spawnDetachedDaemon() error {
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	exe, _ = filepath.EvalSymlinks(exe)
+
+	cmd := exec.Command(exe, "--daemon")
+	devNull, _ := os.OpenFile(os.DevNull, os.O_RDWR, 0)
+	if devNull != nil {
+		cmd.Stdin = devNull
+		cmd.Stdout = devNull
+		cmd.Stderr = devNull
+	}
+	detachChild(cmd)
+	return cmd.Start()
 }
 
 func printStatus(cfg *config.BranchConfig) {
@@ -953,6 +1006,8 @@ func performAutoUpdate(alog *activityLog) bool {
 
 	execPath, err := os.Executable()
 	if err != nil {
+		log.Printf("auto-update: cannot resolve own path: %v", err)
+		alog.Add(fmt.Sprintf("Auto-update failed: cannot resolve own path (%v)", err))
 		return false
 	}
 	execPath, _ = filepath.EvalSymlinks(execPath)
@@ -960,12 +1015,18 @@ func performAutoUpdate(alog *activityLog) bool {
 	tmpPath := execPath + ".update"
 	tmp, err := os.Create(tmpPath)
 	if err != nil {
+		// Common failure: binary directory is root-owned but daemon runs
+		// as a regular user. Surface this loudly so the user can re-install.
+		log.Printf("auto-update: cannot write %s: %v", tmpPath, err)
+		alog.Add(fmt.Sprintf("Auto-update failed: cannot write %s (%v) — re-run install.sh to fix permissions", tmpPath, err))
 		return false
 	}
 
 	if _, err := io.Copy(tmp, dlResp.Body); err != nil {
 		tmp.Close()
 		os.Remove(tmpPath)
+		log.Printf("auto-update: copy to %s failed: %v", tmpPath, err)
+		alog.Add(fmt.Sprintf("Auto-update failed: copy to %s (%v)", tmpPath, err))
 		return false
 	}
 	tmp.Close()
@@ -979,6 +1040,11 @@ func performAutoUpdate(alog *activityLog) bool {
 	}
 	if err := os.Rename(tmpPath, execPath); err != nil {
 		os.Remove(tmpPath)
+		// Same root cause as the os.Create EACCES above — without this log
+		// the user sees the daemon happily reconnecting every 15 minutes and
+		// no clue that the new binary never lands.
+		log.Printf("auto-update: rename %s -> %s failed: %v", tmpPath, execPath, err)
+		alog.Add(fmt.Sprintf("Auto-update failed: cannot replace %s (%v) — re-run install.sh to fix permissions", execPath, err))
 		return false
 	}
 
