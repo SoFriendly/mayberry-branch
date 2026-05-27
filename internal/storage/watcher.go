@@ -76,6 +76,9 @@ func (w *Watcher) scan() {
 			if err != nil || info == nil {
 				return nil // skip inaccessible paths
 			}
+			if info.IsDir() && IsSkippedDir(info.Name()) {
+				return filepath.SkipDir
+			}
 			if !info.IsDir() && IsSupportedFile(p) {
 				current[p] = info.ModTime()
 			}

@@ -231,14 +231,42 @@ func startBackgroundServices(ctx context.Context, cfg *config.BranchConfig, hubU
 	// Create local HTTP server with a swappable handler.
 	branchSrv := branchhttp.NewServer("", cfg.LibraryPath)
 	branchSrv.SetConfig(cfg)
+	branchSrv.SetVersion(Version)
+	branchSrv.SetShutdownCallback(daemonShutdownCallback(alog))
 
 	swap := &handlerSwap{handler: branchSrv}
 
-	// Bind the HTTP server. If the configured port is in use (another
-	// daemon, leftover process), walk forward up to 10 ports until we find
-	// a free one. Then update cfg.Port so the tunnel and dashboard use the
-	// real bound port — this prevents the "tunnel works but localhost
-	// refuses" failure mode where readers see empty-body 502s.
+	// Singleton check with takeover semantics. If another mayberry daemon
+	// is on our configured port, ask it to shut down so this newer
+	// process can replace it. Without this, auto-update can leave the
+	// old version running if the service manager's stop-then-start
+	// transition is sloppy, and manual reruns can stack daemons (see the
+	// the-grove operator's four-daemon incident).
+	if existingVersion, ok := probeRunningDaemon(cfg.Port); ok {
+		if existingVersion == Version && existingVersion != "" {
+			// Same version, no point taking over — defer to the running one.
+			fmt.Fprintf(os.Stderr, "Mayberry %s is already running on port %d. Exiting.\n", existingVersion, cfg.Port)
+			alog.Add(fmt.Sprintf("Refusing to start: same-version daemon already on port %d", cfg.Port))
+			os.Exit(0)
+		}
+		// Different version (or unknown — pre-shutdown-endpoint release).
+		// Try to take over.
+		log.Printf("branch: existing daemon on port %d (version %q), attempting takeover for %s", cfg.Port, existingVersion, Version)
+		alog.Add(fmt.Sprintf("Existing daemon on port %d — taking over for %s", cfg.Port, Version))
+		if !takeOverExistingDaemon(cfg.Port) {
+			// Couldn't get the port — likely an old daemon without the
+			// /api/shutdown endpoint, or it hung. Defer cleanly.
+			fmt.Fprintf(os.Stderr, "Existing mayberry daemon on port %d wouldn't release — exiting. Kill it manually if needed.\n", cfg.Port)
+			alog.Add(fmt.Sprintf("Could not take over port %d — exiting", cfg.Port))
+			os.Exit(0)
+		}
+		log.Printf("branch: took over port %d from previous daemon", cfg.Port)
+	}
+
+	// Bind the HTTP server. If the configured port is in use (some non-
+	// mayberry process), walk forward up to 10 ports until we find a free
+	// one. Then update cfg.Port so the tunnel and dashboard use the real
+	// bound port.
 	listener, boundPort, err := listenWithRetry(cfg.Port, 10)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to bind any local port near %d: %v\n", cfg.Port, err)
@@ -274,6 +302,8 @@ func startBackgroundServices(ctx context.Context, cfg *config.BranchConfig, hubU
 
 		newSrv := branchhttp.NewServer("", updated.LibraryPath)
 		newSrv.SetConfig(cfg)
+		newSrv.SetVersion(Version)
+		newSrv.SetShutdownCallback(daemonShutdownCallback(alog))
 		swap.Set(newSrv)
 
 		// Trigger an initial scan of both library paths.
@@ -326,6 +356,8 @@ func startFullServices(ctx context.Context, cfg *config.BranchConfig, hubURL str
 	if branchID != "" {
 		branchSrv = branchhttp.NewServer(branchID, cfg.LibraryPath)
 		branchSrv.SetConfig(cfg)
+		branchSrv.SetVersion(Version)
+		branchSrv.SetShutdownCallback(daemonShutdownCallback(alog))
 		branchSrv.SetSetupCallback(func(updated *config.BranchConfig) {
 			// Settings changed — update config. Watcher dirs apply on next restart.
 			cfg.LibraryPath = updated.LibraryPath
@@ -1060,6 +1092,73 @@ func performAutoUpdate(alog *activityLog) bool {
 	log.Printf("auto-update: scheduling restart")
 	scheduleRestart()
 	return true
+}
+
+// daemonShutdownCallback returns a function suitable for SetShutdownCallback.
+// It logs, gives the HTTP response a moment to flush, then exits the process
+// cleanly. Called when another mayberry process is taking over the port.
+func daemonShutdownCallback(alog *activityLog) func() {
+	return func() {
+		log.Printf("branch: shutdown requested by takeover")
+		alog.Add("Another mayberry process is taking over — exiting")
+		time.Sleep(500 * time.Millisecond) // let /api/shutdown response flush
+		os.Exit(0)
+	}
+}
+
+// probeRunningDaemon checks if a Mayberry daemon is listening on the given
+// port. Returns the running daemon's version on success (may be empty for
+// pre-shutdown-endpoint releases) and ok=true. False positives are very
+// unlikely because /api/status responds with a JSON shape that includes
+// branch_id — generic 200-OK doesn't match.
+func probeRunningDaemon(port int) (version string, ok bool) {
+	client := &http.Client{Timeout: 1 * time.Second}
+	resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%d/api/status", port))
+	if err != nil {
+		return "", false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", false
+	}
+	var body struct {
+		BranchID string `json:"branch_id"`
+		Version  string `json:"version"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&body); err != nil {
+		return "", false
+	}
+	if body.BranchID == "" {
+		return "", false
+	}
+	return body.Version, true
+}
+
+// takeOverExistingDaemon asks the running daemon on `port` to exit via
+// POST /api/shutdown, then waits for the port to free up. Returns true if
+// the port becomes bindable within 5 seconds. Used by the new daemon
+// when it detects an older sibling — auto-update relies on this for
+// version-rollover when the service-manager-driven restart doesn't fully
+// take down the old process before the new one starts.
+func takeOverExistingDaemon(port int) bool {
+	client := &http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Post(fmt.Sprintf("http://127.0.0.1:%d/api/shutdown", port), "application/json", nil)
+	if err != nil {
+		return false
+	}
+	resp.Body.Close()
+	// Poll: try to bind the port to confirm it's free. Up to 5s total at
+	// 200ms cadence — the existing daemon's onShutdown does os.Exit(0)
+	// after a brief flush delay, so usually frees within a second.
+	for i := 0; i < 25; i++ {
+		time.Sleep(200 * time.Millisecond)
+		l, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+		if err == nil {
+			l.Close()
+			return true
+		}
+	}
+	return false
 }
 
 // listenWithRetry tries to bind on startPort, then walks forward up to

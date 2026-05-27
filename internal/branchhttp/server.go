@@ -195,8 +195,10 @@ type Server struct {
 	holdings map[string]string // isbn -> filepath
 
 	cfg            *config.BranchConfig
+	version        string // set by main, surfaced in /api/status for version-aware singleton checks
 	onSetup        SetupCallback
 	onRestart      RestartCallback
+	onShutdown     RestartCallback // same shape as restart, but no restart — used by takeover
 	onSync         SyncCallback
 	onMirrorServe  MirrorServeCallback
 	onMirrorStats  MirrorStatsFn
@@ -246,6 +248,18 @@ func (s *Server) SetSetupCallback(cb SetupCallback) {
 // daemon restart from the settings UI.
 func (s *Server) SetRestartCallback(cb RestartCallback) {
 	s.onRestart = cb
+}
+
+// SetShutdownCallback sets the function called when /api/shutdown is
+// hit locally (used by another mayberry process taking over the port).
+func (s *Server) SetShutdownCallback(cb RestartCallback) {
+	s.onShutdown = cb
+}
+
+// SetVersion records the running daemon's version so /api/status can
+// surface it. Lets a competing daemon decide whether to take over.
+func (s *Server) SetVersion(v string) {
+	s.version = v
 }
 
 // SetSyncCallback sets the function called when the user requests an
@@ -494,6 +508,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/settings", localOnly(s.handleSettingsPage))
 	s.mux.HandleFunc("/api/catalog", localOnly(s.handleCatalog))
 	s.mux.HandleFunc("/api/status", localOnly(s.handleStatus))
+	s.mux.HandleFunc("/api/shutdown", localOnly(s.handleShutdown))
 	s.mux.HandleFunc("/api/setup", localOnly(s.handleSetup))
 	s.mux.HandleFunc("/api/restart", localOnly(s.handleRestart))
 	s.mux.HandleFunc("/api/sync", localOnly(s.handleSyncNow))
@@ -1670,11 +1685,33 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	json.NewEncoder(w).Encode(map[string]any{
-		"branch_id":    s.branchID,
-		"book_count":   len(s.catalog),
-		"isbn_count":   len(s.holdings),
-		"needs_setup":  s.needsSetup(),
+		"branch_id":   s.branchID,
+		"book_count":  len(s.catalog),
+		"isbn_count":  len(s.holdings),
+		"needs_setup": s.needsSetup(),
+		"version":     s.version,
 	})
+}
+
+// handleShutdown exits the daemon cleanly. Triggered by another local
+// mayberry process taking over the port — see isMayberryAlreadyRunning
+// in cmd/branch/main.go. Local-only by the localOnly middleware so an
+// external attacker can't crash branches across the network.
+func (s *Server) handleShutdown(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", 405)
+		return
+	}
+	if s.onShutdown == nil {
+		http.Error(w, "Shutdown not wired", 501)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "shutting down"})
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+	go s.onShutdown()
 }
 
 func (s *Server) handleFavicon(w http.ResponseWriter, r *http.Request) {
