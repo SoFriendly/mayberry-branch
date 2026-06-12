@@ -395,14 +395,58 @@ func startFullServices(ctx context.Context, cfg *config.BranchConfig, hubURL str
 	if cfg.AudiobookPath != "" {
 		watchDirs = append(watchDirs, cfg.AudiobookPath)
 	}
+	// Sync sender: one at a time, with retry. A failed sync used to be
+	// dropped on the floor — the next attempt only came with the next
+	// library change, so a transient failure could leave Town Square
+	// stale for days while the activity log still claimed "Synced".
+	// The 1-slot queue keeps only the newest catalog; older lists are
+	// superseded, never sent late.
+	syncQueue := make(chan []branchhttp.BookMeta, 1)
+	queueSync := func(books []branchhttp.BookMeta) {
+		for {
+			select {
+			case syncQueue <- books:
+				return
+			default:
+				select {
+				case <-syncQueue: // drop the superseded list
+				default:
+				}
+			}
+		}
+	}
+	go func() {
+		var pending []branchhttp.BookMeta
+		var retry <-chan time.Time
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case pending = <-syncQueue:
+			case <-retry:
+			}
+			retry = nil
+			if pending == nil {
+				continue
+			}
+			if err := syncBooks(cfg.ServerURL, branchID, branchSrv.CoverDir(), pending); err != nil {
+				log.Printf("branch: sync: %v (retrying in 1m)", err)
+				alog.Add("Sync to Town Square failed — retrying in 1 minute")
+				retry = time.After(time.Minute)
+				continue
+			}
+			alog.Add(fmt.Sprintf("Synced %d title(s) to Town Square", len(pending)))
+			pending = nil
+		}
+	}()
+
 	scanAndSync := func(paths []string) {
 		books := branchSrv.UpdateCatalog(paths)
 		state.setBookCount(len(paths), len(books))
 		state.setStatus("watcher", "watching")
 		alog.Add(fmt.Sprintf("Scanned %d file(s), %d cataloged", len(paths), len(books)))
 		if branchID != "" {
-			syncBooks(cfg.ServerURL, branchID, branchSrv.CoverDir(), books)
-			alog.Add(fmt.Sprintf("Synced %d title(s) to Town Square", len(books)))
+			queueSync(books)
 		}
 	}
 	watcher := storage.NewMultiWatcher(watchDirs, 30*time.Second, scanAndSync)
@@ -571,31 +615,41 @@ func fetchTunnelToken(serverURL, branchID, subdomain string) (string, int) {
 	return result.Token, resp.StatusCode
 }
 
-func syncBooks(serverURL, branchID, coverDir string, books []branchhttp.BookMeta) {
+// syncClient allows /api/branches/sync more time than the general
+// 15-second httpClient: a full-catalog payload takes a while to upsert
+// server-side, and a client that gives up early leaves the server
+// still processing — which is how overlapping syncs (and the stale-
+// holdings race) happened.
+var syncClient = &http.Client{Timeout: 2 * time.Minute}
+
+// syncBooks pushes the full catalog to Town Square. A non-nil return
+// means the catalog may not have landed and the caller should retry.
+func syncBooks(serverURL, branchID, coverDir string, books []branchhttp.BookMeta) error {
 	body, err := json.Marshal(map[string]any{
 		"branch_id": branchID,
 		"books":     books,
 	})
 	if err != nil {
-		log.Printf("branch: sync marshal: %v", err)
-		return
+		return fmt.Errorf("marshal: %w", err)
 	}
-	resp, err := httpClient.Post(serverURL+"/api/branches/sync", "application/json", bytes.NewReader(body))
+	resp, err := syncClient.Post(serverURL+"/api/branches/sync", "application/json", bytes.NewReader(body))
 	if err != nil {
-		log.Printf("branch: sync: %v", err)
-		return
+		return err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("server returned %s", resp.Status)
+	}
 
 	var result struct {
 		Status      string   `json:"status"`
 		NeedsCovers []string `json:"needs_covers"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return
+		return nil // sync landed; cover hints are best-effort
 	}
 	if coverDir == "" || len(result.NeedsCovers) == 0 {
-		return
+		return nil
 	}
 	uploaded := 0
 	for _, isbn := range result.NeedsCovers {
@@ -606,6 +660,7 @@ func syncBooks(serverURL, branchID, coverDir string, books []branchhttp.BookMeta
 	if uploaded > 0 {
 		log.Printf("branch: uploaded %d cover(s) to Town Square", uploaded)
 	}
+	return nil
 }
 
 // uploadCover sends a single cover image to Town Square. Returns true on
