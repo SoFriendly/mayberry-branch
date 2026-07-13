@@ -49,8 +49,12 @@ services:
       # across restarts and image upgrades.
       - mayberry-data:/home/mayberry/.mayberry
 
-    # If your host library is owned by a uid other than 1000, uncomment and set it
-    # to match, e.g. `user: "1001:1001"`. The image's mayberry user is uid 1000.
+    # Only needed if your library is not world-readable (it is mounted read-only,
+    # so any uid can read a normal 0755 tree). If you do need to match the host
+    # owner, override the uid but KEEP THE GID AT 1000: the mayberry-data volume
+    # is seeded from the image owned by gid 1000, and the daemon has to be able to
+    # write branch.json there or it regenerates its identity on every restart.
+    # e.g. `user: "1001:1000"`.
     # user: "1000:1000"
 
 volumes:

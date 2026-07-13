@@ -24,23 +24,40 @@ export MAYBERRY_LIBRARY="${MAYBERRY_LIBRARY:-/library}"
 # with jq here, before exec, so LoadBranch picks it up on startup like any other
 # field. That is where such a merge would go -- right here, ahead of the exec.
 
+# Normalize MAYBERRY_MIRROR_NETWORK to a plain true/false up front. The set of
+# spellings Go's flag package accepts (strconv.ParseBool) is narrower than what
+# people reach for: "yes" would sail past a naive truthiness test here and then
+# make flag.Parse die with a usage dump. Decide once, reject the rest by name.
+case "${MAYBERRY_MIRROR_NETWORK:-false}" in
+  true | True | TRUE | 1 | t | T | yes | Yes | YES | on | On | ON)
+    mirror_network=true ;;
+  false | False | FALSE | 0 | f | F | no | No | NO | off | Off | OFF | "")
+    mirror_network=false ;;
+  *)
+    echo "mayberry: MAYBERRY_MIRROR_NETWORK must be true or false, got '${MAYBERRY_MIRROR_NETWORK}'." >&2
+    exit 1
+    ;;
+esac
+
 # The mirror writes into <library>/_mirror, a path hardcoded by
 # internal/mirror/paths.go, which is why compose mounts mirror storage at exactly
 # that path rather than somewhere of its own choosing. Without that mount
 # EnsureMirrorRoot fails and internal/mirror/manager.go merely logs
 # "mirror: disabling" and returns, leaving the daemon running with mirroring
 # silently dead. Catch it here instead, while we can still say why.
-case "${MAYBERRY_MIRROR_NETWORK:-false}" in
-  true | True | TRUE | 1 | t | T)
-    probe="$MAYBERRY_LIBRARY/_mirror/.write-test"
-    if ! touch "$probe" 2>/dev/null; then
-      echo "mayberry: MAYBERRY_MIRROR_NETWORK is on, but $MAYBERRY_LIBRARY/_mirror is not writable." >&2
-      echo "mayberry: uncomment the mirror volume in docker-compose.yaml and set MAYBERRY_MIRROR_PATH." >&2
-      exit 1
-    fi
-    rm -f "$probe"
-    ;;
-esac
+if [ "$mirror_network" = true ]; then
+  probe="$MAYBERRY_LIBRARY/_mirror/.write-test"
+  if ! touch "$probe" 2>/dev/null; then
+    echo "mayberry: MAYBERRY_MIRROR_NETWORK is on, but $MAYBERRY_LIBRARY/_mirror is not writable by uid $(id -u)." >&2
+    echo "mayberry: two things have to be true --" >&2
+    echo "mayberry:   1. the /library/_mirror volume in docker-compose.yaml is uncommented, and" >&2
+    echo "mayberry:   2. the host directory it points at (MAYBERRY_MIRROR_PATH) is writable by uid $(id -u)." >&2
+    echo "mayberry: Docker creates a missing host path as root, so a first run with the default" >&2
+    echo "mayberry: ./data/mirror needs: mkdir -p ./data/mirror && chown $(id -u):$(id -g) ./data/mirror" >&2
+    exit 1
+  fi
+  rm -f "$probe"
+fi
 
 # Mirror flags are passed unconditionally, with defaults matching config.go's.
 # Omitting a flag makes main() fall back to whatever the persisted branch.json
@@ -49,7 +66,7 @@ esac
 # keeps the container's configuration declarative.
 set -- --daemon
 set -- "$@" -name "$MAYBERRY_NAME"
-set -- "$@" "-mirror-network=${MAYBERRY_MIRROR_NETWORK:-false}"
+set -- "$@" "-mirror-network=$mirror_network"
 set -- "$@" -mirror-size "${MAYBERRY_MIRROR_SIZE:-100G}"
 set -- "$@" -mirror-rate "${MAYBERRY_MIRROR_RATE:-slow}"
 set -- "$@" -mirror-serve-rate "${MAYBERRY_MIRROR_SERVE_RATE:-200K}"
