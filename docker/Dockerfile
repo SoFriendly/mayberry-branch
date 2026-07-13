@@ -39,7 +39,7 @@ RUN apk add --no-cache ca-certificates tzdata \
 RUN chown root:root /library && chmod 755 /library
 
 COPY --from=build /out/mayberry /usr/local/bin/mayberry
-COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+COPY docker/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
 # uid/gid 1000 matches the first user on a typical Linux desktop, so bind-mounted

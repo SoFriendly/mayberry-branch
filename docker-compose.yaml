@@ -1,7 +1,11 @@
+name: mayberry-branch
 services:
   mayberry:
     build:
+      # Context is the repo root (the Go source lives here); the Dockerfile path is
+      # resolved relative to that context, not to this file.
       context: .
+      dockerfile: docker/Dockerfile
     image: mayberry-branch:latest
     container_name: mayberry-branch
     restart: unless-stopped
@@ -20,7 +24,7 @@ services:
       MAYBERRY_SERVER: ${MAYBERRY_SERVER:-https://mayberry.pub}
       MAYBERRY_HUB: ${MAYBERRY_HUB:-https://branch.pub}
 
-      # Network mirror: opt-in failover mirroring of other branches. See MIRROR.md.
+      # Network mirror: opt-in failover mirroring of other branches. See docker/README.md.
       # Turning this on also requires uncommenting the /library/_mirror volume below.
       MAYBERRY_MIRROR_NETWORK: ${MAYBERRY_MIRROR_NETWORK:-false}
       MAYBERRY_MIRROR_SIZE: ${MAYBERRY_MIRROR_SIZE:-100G}
@@ -53,4 +57,4 @@ volumes:
   mayberry-data:
 
 # Audiobook libraries are not supported by this image. audiobook_path is the only
-# setting upstream exposes no CLI flag for; see docker-entrypoint.sh for details.
+# setting upstream exposes no CLI flag for; see docker/docker-entrypoint.sh for details.

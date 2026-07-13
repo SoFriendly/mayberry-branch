@@ -25,7 +25,7 @@ go build -o mayberry ./cmd/branch
 
 **Docker:**
 
-See [DOCKER.md](DOCKER.md) for running Mayberry via `docker compose`, fully configured through environment variables.
+See [docker/README.md](docker/README.md) for running Mayberry via `docker compose`, fully configured through environment variables.
 
 ## Usage
 

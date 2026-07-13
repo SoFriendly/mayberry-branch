@@ -1,7 +1,13 @@
 .git
 .gitignore
 data
-Dockerfile
+.env
+
+# docker/docker-entrypoint.sh is deliberately absent: the Dockerfile COPYs it.
+docker/Dockerfile
 docker-compose.yaml
 .dockerignore
-*.md
+
+# Needs the ** prefix to reach docker/README.md. In .dockerignore patterns a bare
+# `*` does not cross a `/`, so `*.md` alone would only match the repo root.
+**/*.md

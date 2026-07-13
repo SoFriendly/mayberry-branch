@@ -1,11 +1,17 @@
 # Docker
 
-Run Mayberry dlacaratively as a container, fully configured through environment variables. No setup wizard, no interactive prompts.
+Run Mayberry declaratively as a container, fully configured through environment variables. No setup wizard, no interactive prompts.
+
+## Layout
+
+The image is built from `docker/Dockerfile`, but `docker-compose.yaml` and your `.env` live at the repo root, because that is where Docker's conventions want them: the build context has to be the repo root (that is where the Go source is), and compose only discovers a compose file in the current directory or its parents.
+
+Run every `docker compose` command below **from the repo root**, not from this directory.
 
 ## Quick Start
 
 ```sh
-cp .env.sample .env
+cp docker/.env.sample .env
 # Edit .env and set MAYBERRY_NAME and MAYBERRY_LIBRARY_PATH
 docker compose up -d
 ```
@@ -31,7 +37,7 @@ Every Mayberry setting (except audiobook paths) can be set via environment varia
 | `MAYBERRY_MIRROR_SERVE_RATE` | No | `200K` | Outbound bandwidth cap when serving mirror requests, e.g. `200K`, `5M` (only if mirroring on) |
 | `MAYBERRY_MIRROR_PATH` | No | `./data/mirror` | Host path where mirrored books land; only applies if the `/library/_mirror` volume is uncommented in `docker-compose.yaml` |
 
-See `.env.sample` for documentation of each variable and MIRROR.md for mirror-specific details.
+See `docker/.env.sample` for documentation of each variable.
 
 ## Key Differences from Native Install
 
@@ -99,4 +105,4 @@ The following environment variables are read natively by `cmd/branch/main.go` (w
 - `MAYBERRY_SERVER` — read by the `-server` flag's default
 - `MAYBERRY_HUB` — read by the `-hub` flag's default
 
-See `docker-entrypoint.sh` for implementation details.
+See `docker/docker-entrypoint.sh` for implementation details.
