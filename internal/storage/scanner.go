@@ -7,8 +7,14 @@ import (
 )
 
 // IsSupportedFile returns true if the path looks like a file we handle
-// (EPUB ebook or M4B audiobook). Case-insensitive on extension.
+// (EPUB ebook or M4B audiobook). Case-insensitive on extension. Excludes
+// dotfiles (hidden copies, macOS AppleDouble resource forks like
+// "._Book.epub") which otherwise pass the extension check and can slip
+// into the catalog as spurious entries.
 func IsSupportedFile(p string) bool {
+	if strings.HasPrefix(filepath.Base(p), ".") {
+		return false
+	}
 	ext := strings.ToLower(filepath.Ext(p))
 	return ext == ".epub" || ext == ".m4b"
 }
