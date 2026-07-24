@@ -506,7 +506,7 @@ func localOnly(next http.HandlerFunc) http.HandlerFunc {
 func (s *Server) routes() {
 	s.mux.HandleFunc("/", s.handleDashboard)
 	s.mux.HandleFunc("/settings", localOnly(s.handleSettingsPage))
-	s.mux.HandleFunc("/api/catalog", localOnly(s.handleCatalog))
+	s.mux.HandleFunc("/api/catalog", s.handleCatalog)
 	s.mux.HandleFunc("/api/status", localOnly(s.handleStatus))
 	s.mux.HandleFunc("/api/shutdown", localOnly(s.handleShutdown))
 	s.mux.HandleFunc("/api/setup", localOnly(s.handleSetup))
