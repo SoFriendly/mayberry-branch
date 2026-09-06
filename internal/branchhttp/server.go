@@ -1037,6 +1037,14 @@ func (s *Server) serveDashboard(w http.ResponseWriter, r *http.Request) {
 		subdomain = s.cfg.Subdomain + ".branch.pub"
 	}
 
+	// Library card panel — the owner's ID doubles as their sign-in
+	// credential, so it renders ONLY for local requests. Friends viewing
+	// this dashboard through the tunnel must not see it.
+	var cardHTML string
+	if r.Header.Get("X-Mayberry-Via-Tunnel") == "" && s.cfg != nil && s.cfg.UserID != "" {
+		cardHTML = libraryCardHTML(s.cfg.UserID)
+	}
+
 	var warningsHTML string
 	if len(scanWarnings) > 0 {
 		var items strings.Builder
@@ -1284,6 +1292,7 @@ func (s *Server) serveDashboard(w http.ResponseWriter, r *http.Request) {
     <div id="scan-progress-text" class="scan-progress-text"></div>
   </div>
   %s
+  %s
   <div class="stats-grid">
     <div class="stat-card">
       <div class="stat-num">%d</div>
@@ -1340,7 +1349,28 @@ function pollScanStatus(){
 pollScanStatus();
 </script>
 </body>
-</html>`, branchName, branchName, subdomain, warningsHTML, bookCount, isbnCount)
+</html>`, branchName, branchName, subdomain, warningsHTML, cardHTML, bookCount, isbnCount)
+}
+
+// libraryCardHTML renders the owner's library card panel on the local
+// dashboard: the ID itself plus how to use it. Never rendered for
+// tunnel visitors — the ID is the owner's sign-in credential.
+func libraryCardHTML(userID string) string {
+	id := html.EscapeString(userID)
+	return fmt.Sprintf(`<div class="section" style="margin-bottom:2rem">
+    <div class="section-title">Your Library Card</div>
+    <div style="background:hsl(var(--card));border:1px solid hsl(var(--border) / 0.06);border-radius:var(--radius);box-shadow:var(--shadow-sm);padding:1.25rem 1.4rem">
+      <div style="display:flex;align-items:center;gap:0.9rem;flex-wrap:wrap;margin-bottom:0.9rem">
+        <span style="font-family:var(--font-mono);font-size:1.6rem;font-weight:600;color:hsl(var(--primary));letter-spacing:0.12em">%s</span>
+        <button type="button" onclick="navigator.clipboard.writeText('%s').then(()=>{this.textContent='Copied ✓';setTimeout(()=>this.textContent='Copy',1500)})" style="background:transparent;border:1px solid hsl(var(--border) / 0.15);border-radius:calc(var(--radius) - 2px);padding:0.3rem 0.7rem;font-size:0.72rem;cursor:pointer;color:hsl(var(--muted-foreground));text-transform:uppercase;letter-spacing:0.05em;font-family:var(--font-sans)">Copy</button>
+      </div>
+      <ul style="margin:0;padding-left:1.1rem;font-size:0.88rem;color:hsl(var(--foreground));line-height:1.7">
+        <li><strong>Read:</strong> point any OPDS reading app at <code style="font-family:var(--font-mono);font-size:0.82rem;background:hsl(var(--muted));padding:0.1rem 0.4rem;border-radius:4px">https://mayberry.pub/opds</code> and sign in with this card number as <strong>both username and password</strong>.</li>
+        <li><strong>Borrow from friends:</strong> send them this number — when they add it under People with Access on their branch, their books appear in your reader.</li>
+        <li><strong>Lend your books:</strong> add friends' card numbers (or create guest cards) in <a href="/settings" style="color:hsl(var(--primary))">Settings &rarr; Sharing</a>.</li>
+      </ul>
+    </div>
+  </div>`, id, id)
 }
 
 // --- Setup API ---
