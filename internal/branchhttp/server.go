@@ -1972,7 +1972,7 @@ func sharingSettingsHTML(cfg *config.BranchConfig) string {
       <div class="picker-selected" style="margin-bottom:0.9rem"><span id="my-user-id">%s</span><button type="button" class="change-btn" onclick="copyText('my-user-id', this)">Copy</button></div>
       <label for="shared_users">People with access</label>
       <div class="hint">Comma-separated user IDs allowed to browse and download from this branch. Remove an ID to revoke access.</div>
-      <input type="text" id="shared_users" value="%s" placeholder="x7k2m9qp4, b3n8w2rty">
+      <input type="text" id="shared_users" value="%s" placeholder="204817396, 731920458">
       <label style="margin-top:0.9rem">Guest library card</label>
       <div class="hint">Friend doesn't have a user ID yet? Create one here — it's added to your access list instantly, so you can just send it to them.</div>
       <button type="button" class="change-btn" id="guest-card-btn" style="padding:0.45rem 0.9rem;font-size:0.78rem" onclick="createGuestCard()">Create Guest Card</button>

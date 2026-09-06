@@ -14,31 +14,38 @@ import (
 // username and password, since readers like Crosspoint require both
 // fields to be non-empty before they send the header.
 
-// Kept short (9 chars) so it's painless to type on an e-reader's
-// on-screen keyboard; 36^9 ≈ 46 bits is still far beyond guessable.
+// Kept short (9 digits, leading digit non-zero) so it reads and types
+// like a real library card number on an e-reader keyboard. ~10^9
+// combinations is plenty while the network is small; lengthen userIDLen
+// if it grows — ValidUserID is deliberately loose, so old IDs (including
+// pre-numeric alphanumeric ones) stay valid.
 const userIDLen = 9
 
-const userIDAlphabet = "abcdefghijklmnopqrstuvwxyz0123456789"
-
 // userIDRe accepts our generated form plus room for future variants.
-// Deliberately loose on length so a format change doesn't strand old IDs.
 var userIDRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{2,63}$`)
 
-// GenerateUserID returns a new random user ID like "x7k2m9qp4".
+// GenerateUserID returns a new random numeric user ID like "204817396".
 func GenerateUserID() (string, error) {
 	buf := make([]byte, userIDLen)
-	// Rejection-sample so every alphabet character is equally likely:
-	// 252 is the largest multiple of 36 that fits in a byte.
-	const limit = byte(252)
+	// Rejection-sample so every digit is equally likely: 250 is the
+	// largest multiple of 10 that fits in a byte (252 for the 9-way
+	// non-zero first digit).
 	for i := 0; i < userIDLen; {
 		var b [1]byte
 		if _, err := rand.Read(b[:]); err != nil {
 			return "", fmt.Errorf("generate user id: %w", err)
 		}
-		if b[0] >= limit {
-			continue
+		if i == 0 {
+			if b[0] >= 252 {
+				continue
+			}
+			buf[i] = '1' + b[0]%9
+		} else {
+			if b[0] >= 250 {
+				continue
+			}
+			buf[i] = '0' + b[0]%10
 		}
-		buf[i] = userIDAlphabet[int(b[0])%len(userIDAlphabet)]
 		i++
 	}
 	return string(buf), nil
