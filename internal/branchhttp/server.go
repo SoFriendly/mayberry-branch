@@ -1367,8 +1367,8 @@ func libraryCardHTML(userID string) string {
       </div>
       <ul style="margin:0;padding-left:1.1rem;font-size:0.88rem;color:hsl(var(--foreground));line-height:1.7">
         <li><strong>Read:</strong> point any OPDS reading app at <code style="font-family:var(--font-mono);font-size:0.82rem;background:hsl(var(--muted));padding:0.1rem 0.4rem;border-radius:4px">https://mayberry.pub</code> and sign in with this card number as <strong>both username and password</strong>.</li>
-        <li><strong>Borrow from friends:</strong> send them this number — when they add it under People with Access on their branch, their books appear in your reader.</li>
-        <li><strong>Lend your books:</strong> add friends' card numbers (or create guest cards) in <a href="/settings" style="color:hsl(var(--primary))">Settings &rarr; Sharing</a>.</li>
+        <li><strong>Share with friends:</strong> trade card numbers — sharing is mutual, so when either of you adds the other under People with Access, you both see each other's libraries.</li>
+        <li><strong>Add friends or create guest cards</strong> in <a href="/settings" style="color:hsl(var(--primary))">Settings &rarr; Sharing</a>.</li>
       </ul>
     </div>
   </div>`, id, id)
@@ -2024,7 +2024,7 @@ func sharingSettingsHTML(cfg *config.BranchConfig) string {
       </div>
       <div style="background:hsl(var(--muted) / 0.5);border:1px solid hsl(var(--border) / 0.06);border-radius:var(--radius);padding:1rem 1.1rem;margin-bottom:1rem">
         <div style="font-size:0.92rem;color:hsl(var(--foreground));line-height:1.55">
-          Your library is private. Give your user ID to a friend and they can add it below on <em>their</em> branch to share their books with you; add their ID here to share yours. In your reading app, sign in to the catalog with your user ID as <strong>both username and password</strong>.
+          Your library is private, and sharing is <strong>mutual</strong>: when either of you adds the other's card number, you both see each other's libraries. In your reading app, sign in to the catalog with your card number as <strong>both username and password</strong>.
         </div>
       </div>
       <label>Your User ID</label>
