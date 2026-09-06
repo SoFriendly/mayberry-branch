@@ -752,6 +752,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/restart", localOnly(s.handleRestart))
 	s.mux.HandleFunc("/api/sync", localOnly(s.handleSyncNow))
 	s.mux.HandleFunc("/api/browse", localOnly(s.handleBrowse))
+	s.mux.HandleFunc("/api/sharing", localOnly(s.handleSharing))
 	s.mux.HandleFunc("/api/guest-card", localOnly(s.handleGuestCard))
 	s.mux.HandleFunc("/api/mirror/status", localOnly(s.handleMirrorStatus))
 	s.mux.HandleFunc("/api/mirror/purge", localOnly(s.handleMirrorPurge))
@@ -1509,6 +1510,10 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 	if s.onSetup != nil {
 		go s.onSetup(s.cfg)
 	}
+	// Sharing edits saved through the main form propagate immediately too.
+	if req.SharedUsers != nil {
+		s.triggerShareSync()
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]string{
@@ -1870,6 +1875,31 @@ function copyText(elId, btn) {
     setTimeout(function() { btn.textContent = 'Copy'; }, 1500);
   });
 }
+async function saveSharing() {
+  var btn = document.getElementById('sharing-save-btn');
+  var status = document.getElementById('sharing-status');
+  btn.disabled = true; btn.textContent = 'Saving...'; status.style.display = 'none';
+  function splitCSV(s) { return s.split(',').map(function(x){return x.trim();}).filter(function(x){return x;}); }
+  try {
+    var resp = await fetch('/api/sharing', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ shared_users: splitCSV(document.getElementById('shared_users').value.toLowerCase()) })
+    });
+    var data = await resp.json().catch(function() { return {}; });
+    if (!resp.ok) throw new Error(data.error || 'Save failed');
+    document.getElementById('shared_users').value = (data.shared_users || []).join(', ');
+    status.style.color = 'hsl(var(--success))';
+    status.textContent = 'Sharing saved — syncing to the network now.';
+    status.style.display = 'block';
+  } catch (err) {
+    status.style.color = 'hsl(var(--destructive))';
+    status.textContent = err.message;
+    status.style.display = 'block';
+  } finally {
+    btn.disabled = false; btn.textContent = 'Save Sharing';
+  }
+}
 async function createGuestCard() {
   var btn = document.getElementById('guest-card-btn');
   btn.disabled = true; btn.textContent = 'Creating...';
@@ -2003,11 +2033,66 @@ func sharingSettingsHTML(cfg *config.BranchConfig) string {
       <label for="shared_users">People with access</label>
       <div class="hint">Comma-separated user IDs allowed to browse and download from this branch. Remove an ID to revoke access.</div>
       <input type="text" id="shared_users" value="%s" placeholder="204817396, 731920458">
+      <button type="button" class="btn-primary" id="sharing-save-btn" style="margin-top:0.7rem;width:auto;padding:0.55rem 1.2rem;font-size:0.85rem" onclick="saveSharing()">Save Sharing</button>
+      <div id="sharing-status" style="display:none;margin-top:0.5rem;font-size:0.82rem"></div>
       <label style="margin-top:0.9rem">Guest library card</label>
       <div class="hint">Friend doesn't have a user ID yet? Create one here — it's added to your access list instantly, so you can just send it to them.</div>
       <button type="button" class="change-btn" id="guest-card-btn" style="padding:0.45rem 0.9rem;font-size:0.78rem" onclick="createGuestCard()">Create Guest Card</button>
       <div id="guest-card-result" class="picker-selected" style="display:none;margin-top:0.6rem"><span>New card: <strong id="guest-card-id"></strong></span><button type="button" class="change-btn" onclick="copyText('guest-card-id', this)">Copy</button></div>
     </div>`, html.EscapeString(userID), html.EscapeString(strings.Join(cfg.SharedUsers, ", ")))
+}
+
+// triggerShareSync pushes sharing changes to Town Square immediately.
+// The catalog sync only fires when the library scan sees file changes,
+// so without this an allowlist edit could sit local-only indefinitely
+// and the newly added friend would see nothing. Prefers the full
+// scan+sync callback; falls back to the setup callback.
+func (s *Server) triggerShareSync() {
+	if s.onSync != nil {
+		go s.onSync()
+		return
+	}
+	if s.onSetup != nil {
+		go s.onSetup(s.cfg)
+	}
+}
+
+// handleSharing saves just the sharing allowlist and syncs it to Town
+// Square right away — the Sharing section's own Save button posts here
+// so access changes don't ride on (or wait for) the full settings form.
+func (s *Server) handleSharing(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != http.MethodPost {
+		w.WriteHeader(405)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Method not allowed"})
+		return
+	}
+	if s.cfg == nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Branch not configured yet"})
+		return
+	}
+	var req struct {
+		SharedUsers []string `json:"shared_users"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.WriteHeader(400)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
+		return
+	}
+	s.cfg.SharedUsers = auth.NormalizeUserIDs(req.SharedUsers)
+	if err := config.SaveBranch(s.cfg); err != nil {
+		log.Printf("branch: save sharing: %v", err)
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Failed to save configuration"})
+		return
+	}
+	log.Printf("branch: sharing updated — %d user(s)", len(s.cfg.SharedUsers))
+	s.triggerShareSync()
+	json.NewEncoder(w).Encode(map[string]any{
+		"status":       "ok",
+		"shared_users": s.cfg.SharedUsers,
+	})
 }
 
 // handleGuestCard mints a reader-only user ID (a "guest library card") via
@@ -2060,11 +2145,7 @@ func (s *Server) handleGuestCard(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	log.Printf("branch: issued guest card %s", result.UserID)
-	// Kick the setup callback so the updated shared list syncs to Town
-	// Square on the next scan instead of waiting for a library change.
-	if s.onSetup != nil {
-		go s.onSetup(s.cfg)
-	}
+	s.triggerShareSync()
 	json.NewEncoder(w).Encode(map[string]any{
 		"user_id":      result.UserID,
 		"shared_users": s.cfg.SharedUsers,
