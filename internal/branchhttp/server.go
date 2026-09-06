@@ -1365,7 +1365,7 @@ func libraryCardHTML(userID string) string {
         <button type="button" onclick="navigator.clipboard.writeText('%s').then(()=>{this.textContent='Copied ✓';setTimeout(()=>this.textContent='Copy',1500)})" style="background:transparent;border:1px solid hsl(var(--border) / 0.15);border-radius:calc(var(--radius) - 2px);padding:0.3rem 0.7rem;font-size:0.72rem;cursor:pointer;color:hsl(var(--muted-foreground));text-transform:uppercase;letter-spacing:0.05em;font-family:var(--font-sans)">Copy</button>
       </div>
       <ul style="margin:0;padding-left:1.1rem;font-size:0.88rem;color:hsl(var(--foreground));line-height:1.7">
-        <li><strong>Read:</strong> point any OPDS reading app at <code style="font-family:var(--font-mono);font-size:0.82rem;background:hsl(var(--muted));padding:0.1rem 0.4rem;border-radius:4px">https://mayberry.pub/opds</code> and sign in with this card number as <strong>both username and password</strong>.</li>
+        <li><strong>Read:</strong> point any OPDS reading app at <code style="font-family:var(--font-mono);font-size:0.82rem;background:hsl(var(--muted));padding:0.1rem 0.4rem;border-radius:4px">https://mayberry.pub</code> and sign in with this card number as <strong>both username and password</strong>.</li>
         <li><strong>Borrow from friends:</strong> send them this number — when they add it under People with Access on their branch, their books appear in your reader.</li>
         <li><strong>Lend your books:</strong> add friends' card numbers (or create guest cards) in <a href="/settings" style="color:hsl(var(--primary))">Settings &rarr; Sharing</a>.</li>
       </ul>
