@@ -364,6 +364,7 @@ func startFullServices(ctx context.Context, cfg *config.BranchConfig, hubURL str
 			cfg.AudiobookPath = updated.AudiobookPath
 			cfg.DisplayName = updated.DisplayName
 			cfg.Subdomain = updated.Subdomain
+			cfg.SharedUsers = updated.SharedUsers
 		})
 		swap.Set(branchSrv)
 		state.setStatus("townsquare", "connected")
@@ -429,7 +430,7 @@ func startFullServices(ctx context.Context, cfg *config.BranchConfig, hubURL str
 			if pending == nil {
 				continue
 			}
-			if err := syncBooks(cfg.ServerURL, branchID, branchSrv.CoverDir(), pending); err != nil {
+			if err := syncBooks(cfg.ServerURL, branchID, branchSrv.CoverDir(), pending, cfg.SharedUsers); err != nil {
 				log.Printf("branch: sync: %v (retrying in 1m)", err)
 				alog.Add("Sync to Town Square failed — retrying in 1 minute")
 				retry = time.After(time.Minute)
@@ -449,7 +450,21 @@ func startFullServices(ctx context.Context, cfg *config.BranchConfig, hubURL str
 			queueSync(books)
 		}
 	}
-	watcher := storage.NewMultiWatcher(watchDirs, 30*time.Second, scanAndSync)
+	// Surfaces walk errors (unmounted drive, permission denied, etc.) on the
+	// dashboard every scan so a stale/empty catalog isn't silent. The
+	// activity log only gets an entry on transition (problem starts/clears)
+	// so a persisting issue doesn't spam it every 30s.
+	scanHadErrors := false
+	onScanError := func(errs []string) {
+		branchSrv.SetScanWarnings(errs)
+		if len(errs) > 0 && !scanHadErrors {
+			alog.Add(fmt.Sprintf("Library scan warning: %d issue(s) — see dashboard for details", len(errs)))
+		} else if len(errs) == 0 && scanHadErrors {
+			alog.Add("Library scan issues resolved")
+		}
+		scanHadErrors = len(errs) > 0
+	}
+	watcher := storage.NewMultiWatcher(watchDirs, 30*time.Second, scanAndSync, onScanError)
 	watcher.Start()
 
 	// /api/sync triggers a fresh scan that ignores the watcher's change-tracking.
@@ -570,13 +585,25 @@ func register(cfg *config.BranchConfig) string {
 
 	var result struct {
 		BranchID string `json:"branch_id"`
+		UserID   string `json:"user_id"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		log.Printf("branch: register decode: %v", err)
 		return ""
 	}
+	changed := false
 	if result.BranchID != "" && result.BranchID != cfg.BranchID {
 		cfg.BranchID = result.BranchID
+		changed = true
+	}
+	// The user ID is assigned exactly once by Town Square; persist it the
+	// first time we see it and never overwrite an existing one.
+	if result.UserID != "" && cfg.UserID == "" {
+		cfg.UserID = result.UserID
+		changed = true
+		log.Printf("branch: assigned user ID %s", result.UserID)
+	}
+	if changed {
 		if err := config.SaveBranch(cfg); err != nil {
 			log.Printf("branch: save config: %v", err)
 		}
@@ -624,10 +651,17 @@ var syncClient = &http.Client{Timeout: 2 * time.Minute}
 
 // syncBooks pushes the full catalog to Town Square. A non-nil return
 // means the catalog may not have landed and the caller should retry.
-func syncBooks(serverURL, branchID, coverDir string, books []branchhttp.BookMeta) error {
+// sharedUsers rides along on every sync so allowlist edits in settings
+// propagate within one scan interval; it must be non-nil (an empty list
+// marshals to [] — a JSON null would make Town Square skip the update).
+func syncBooks(serverURL, branchID, coverDir string, books []branchhttp.BookMeta, sharedUsers []string) error {
+	if sharedUsers == nil {
+		sharedUsers = []string{}
+	}
 	body, err := json.Marshal(map[string]any{
-		"branch_id": branchID,
-		"books":     books,
+		"branch_id":       branchID,
+		"books":           books,
+		"shared_user_ids": sharedUsers,
 	})
 	if err != nil {
 		return fmt.Errorf("marshal: %w", err)
@@ -1012,11 +1046,15 @@ func spawnDetachedDaemon() error {
 func printStatus(cfg *config.BranchConfig) {
 	fmt.Printf("  ✓ Branch is running.\n")
 	fmt.Println()
-	fmt.Printf("  Your EPUBs are now discoverable on the Mayberry network.\n")
-	fmt.Printf("  Anyone can browse and download from your branch at:\n")
+	fmt.Printf("  Your branch is private. Share it by giving friends your user ID;\n")
+	fmt.Printf("  people you've added can browse and download at:\n")
 	fmt.Println()
 	fmt.Printf("    https://%s.branch.pub\n", cfg.Subdomain)
 	fmt.Println()
+	if cfg.UserID != "" {
+		fmt.Printf("  Your user ID: %s  (catalog sign-in: use it as username AND password)\n", cfg.UserID)
+		fmt.Println()
+	}
 	fmt.Printf("  Manage your branch:\n")
 	fmt.Printf("    Dashboard:  http://localhost:%d\n", cfg.Port)
 	fmt.Printf("    Settings:   http://localhost:%d/settings\n", cfg.Port)

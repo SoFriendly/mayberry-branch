@@ -21,6 +21,15 @@ type BranchConfig struct {
 	Port          int    `json:"port"`
 	ServerURL     string `json:"server_url"`
 
+	// Sharing — see the Auth Model section in CLAUDE.md.
+	// UserID is assigned once by Town Square at registration and never
+	// changes. It is both the owner's identity (what friends add to their
+	// branch) and their sign-in credential for the catalog.
+	UserID string `json:"user_id,omitempty"`
+	// SharedUsers lists the user IDs allowed to see and download from
+	// this branch. Synced to Town Square with every catalog sync.
+	SharedUsers []string `json:"shared_users"`
+
 	// Network mirror — see MIRROR.md.
 	MirrorNetwork   bool     `json:"mirror_network"`
 	MirrorSize      string   `json:"mirror_size"`       // e.g. "100G", "500M"

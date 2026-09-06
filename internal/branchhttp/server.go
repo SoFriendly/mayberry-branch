@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"html"
 	"io"
 	"log"
 	"net/http"
@@ -96,24 +97,128 @@ const brandCSSTokens = `
 
 // hashCache memoizes file SHA-256 + size, keyed by absolute path and
 // invalidated when size or mtime change. Avoids rehashing every scan tick.
+// Persisted to disk (see load/save) so a restart — including the takeover
+// that happens on every auto-update — doesn't force a full re-hash of the
+// whole library, which for a large collection can take many minutes.
+//
+// bySizeMtime is a secondary index for detecting moved/renamed files: a
+// plain move/rename preserves a file's content and (on virtually every
+// filesystem) its mtime, so a (size, mtime) match at a path we've never
+// seen is treated as "already hashed under a different path" instead of
+// being re-read. This matters for Calibre libraries specifically — editing
+// a book's metadata re-files it into a new folder.
 type hashCache struct {
-	mu      sync.Mutex
-	entries map[string]hashEntry
+	mu          sync.Mutex
+	entries     map[string]hashEntry     // path -> {size, mtime, hash}
+	bySizeMtime map[sizeMtimeKey]string  // (size, mtime) -> hash, derived from entries
+	path        string                   // disk location for persistence; empty disables it
 }
 
 type hashEntry struct {
-	size  int64
-	mtime time.Time
-	hash  string
+	Size  int64     `json:"size"`
+	Mtime time.Time `json:"mtime"`
+	Hash  string    `json:"hash"`
 }
 
-func newHashCache() *hashCache {
-	return &hashCache{entries: make(map[string]hashEntry)}
+type sizeMtimeKey struct {
+	Size  int64
+	Mtime int64 // UnixNano — time.Time isn't a safe map key across (de)serialization
+}
+
+func newHashCache(path string) *hashCache {
+	c := &hashCache{
+		entries:     make(map[string]hashEntry),
+		bySizeMtime: make(map[sizeMtimeKey]string),
+		path:        path,
+	}
+	c.load()
+	return c
+}
+
+// rebuildIndexLocked regenerates bySizeMtime from entries. Caller must hold mu.
+func (c *hashCache) rebuildIndexLocked() {
+	c.bySizeMtime = make(map[sizeMtimeKey]string, len(c.entries))
+	for _, e := range c.entries {
+		c.bySizeMtime[sizeMtimeKey{Size: e.Size, Mtime: e.Mtime.UnixNano()}] = e.Hash
+	}
+}
+
+// load reads the persisted cache from disk, if present. A missing or
+// corrupt file just starts with an empty (in-memory-only) cache — the
+// worst case is re-hashing everything once, same as before persistence
+// existed.
+func (c *hashCache) load() {
+	if c.path == "" {
+		return
+	}
+	data, err := os.ReadFile(c.path)
+	if err != nil {
+		return
+	}
+	var entries map[string]hashEntry
+	if err := json.Unmarshal(data, &entries); err != nil {
+		log.Printf("branch: hash cache at %s is corrupt, starting fresh: %v", c.path, err)
+		return
+	}
+	c.mu.Lock()
+	c.entries = entries
+	c.rebuildIndexLocked()
+	c.mu.Unlock()
+	log.Printf("branch: loaded hash cache (%d entries)", len(entries))
+}
+
+// save writes the current cache to disk via a temp-file-then-rename so a
+// crash mid-write can't corrupt the existing cache.
+func (c *hashCache) save() {
+	if c.path == "" {
+		return
+	}
+	c.mu.Lock()
+	entries := make(map[string]hashEntry, len(c.entries))
+	for k, v := range c.entries {
+		entries[k] = v
+	}
+	c.mu.Unlock()
+
+	data, err := json.Marshal(entries)
+	if err != nil {
+		log.Printf("branch: hash cache marshal failed: %v", err)
+		return
+	}
+	tmp := c.path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0644); err != nil {
+		log.Printf("branch: hash cache save failed: %v", err)
+		return
+	}
+	if err := os.Rename(tmp, c.path); err != nil {
+		log.Printf("branch: hash cache save failed: %v", err)
+	}
+}
+
+// Prune drops entries for paths no longer present in the library (deleted
+// or moved-away-from) so the cache doesn't grow forever, and rebuilds the
+// move-detection index to match. Call after a scan with the current path
+// list.
+func (c *hashCache) Prune(livePaths []string) {
+	live := make(map[string]bool, len(livePaths))
+	for _, p := range livePaths {
+		live[p] = true
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for p := range c.entries {
+		if !live[p] {
+			delete(c.entries, p)
+		}
+	}
+	c.rebuildIndexLocked()
 }
 
 // GetOrCompute returns the file's size and hex SHA-256. If a cached entry
 // matches the current size + mtime, the cached hash is returned without
-// re-reading the file.
+// re-reading the file. Failing that, a (size, mtime) match against some
+// other path is treated as a move/rename and reused the same way — see the
+// hashCache doc comment.
 func (c *hashCache) GetOrCompute(path string) (int64, string, error) {
 	info, err := os.Stat(path)
 	if err != nil {
@@ -121,13 +226,20 @@ func (c *hashCache) GetOrCompute(path string) (int64, string, error) {
 	}
 	size := info.Size()
 	mtime := info.ModTime()
+	key := sizeMtimeKey{Size: size, Mtime: mtime.UnixNano()}
 
 	c.mu.Lock()
 	e, ok := c.entries[path]
-	c.mu.Unlock()
-	if ok && e.size == size && e.mtime.Equal(mtime) {
-		return size, e.hash, nil
+	if ok && e.Size == size && e.Mtime.Equal(mtime) {
+		c.mu.Unlock()
+		return size, e.Hash, nil
 	}
+	if hash, moved := c.bySizeMtime[key]; moved {
+		c.entries[path] = hashEntry{Size: size, Mtime: mtime, Hash: hash}
+		c.mu.Unlock()
+		return size, hash, nil
+	}
+	c.mu.Unlock()
 
 	f, err := os.Open(path)
 	if err != nil {
@@ -141,7 +253,8 @@ func (c *hashCache) GetOrCompute(path string) (int64, string, error) {
 	hash := hex.EncodeToString(h.Sum(nil))
 
 	c.mu.Lock()
-	c.entries[path] = hashEntry{size: size, mtime: mtime, hash: hash}
+	c.entries[path] = hashEntry{Size: size, Mtime: mtime, Hash: hash}
+	c.bySizeMtime[key] = hash
 	c.mu.Unlock()
 	return size, hash, nil
 }
@@ -190,9 +303,17 @@ type Server struct {
 	mirrorServeSlots chan struct{}
 	realDownloads    atomic.Int32
 
-	mu       sync.RWMutex
-	catalog  []CatalogEntry // current epub catalog
-	holdings map[string]string // isbn -> filepath
+	// Live scan progress, polled by the dashboard so a long UpdateCatalog
+	// (large library, cold hash cache) shows as "indexing" instead of a
+	// silent 0-book count.
+	scanning      atomic.Bool
+	scanProcessed atomic.Int64
+	scanTotal     atomic.Int64
+
+	mu           sync.RWMutex
+	catalog      []CatalogEntry // current epub catalog
+	holdings     map[string]string // isbn -> filepath
+	scanWarnings []string          // walk errors from the most recent library scan
 
 	cfg            *config.BranchConfig
 	version        string // set by main, surfaced in /api/status for version-aware singleton checks
@@ -220,6 +341,7 @@ func NewServer(branchID, libraryDir string) *Server {
 	home, _ := os.UserHomeDir()
 	coverDir := filepath.Join(home, ".mayberry", "covers")
 	os.MkdirAll(coverDir, 0755)
+	hashCachePath := filepath.Join(home, ".mayberry", "hashcache.json")
 
 	s := &Server{
 		mux:              http.NewServeMux(),
@@ -227,7 +349,7 @@ func NewServer(branchID, libraryDir string) *Server {
 		libraryDir:       libraryDir,
 		holdings:         make(map[string]string),
 		coverDir:         coverDir,
-		hashes:           newHashCache(),
+		hashes:           newHashCache(hashCachePath),
 		mirrorServeSlots: make(chan struct{}, 1),
 	}
 	s.routes()
@@ -266,6 +388,16 @@ func (s *Server) SetVersion(v string) {
 // immediate library scan + Town Square sync.
 func (s *Server) SetSyncCallback(cb SyncCallback) {
 	s.onSync = cb
+}
+
+// SetScanWarnings records the walk errors (if any) from the most recent
+// library scan — e.g. an unmounted external drive or a permission-denied
+// path — so the dashboard can explain a missing/stale catalog instead of
+// silently showing 0 new books.
+func (s *Server) SetScanWarnings(warnings []string) {
+	s.mu.Lock()
+	s.scanWarnings = warnings
+	s.mu.Unlock()
 }
 
 // SetMirrorServeCallback sets the function called when we serve a file
@@ -348,132 +480,200 @@ func bookID(isbn, title, author, mediaType string) string {
 	return "MB" + hex.EncodeToString(h[:6]) // e.g. "MB1a2b3c4d5e6f"
 }
 
-// UpdateCatalog replaces the current catalog with newly scanned book files.
-// Both .epub (ebook) and .m4b (audiobook) paths are accepted. Returns metadata
-// for all titles (for sync to Town Square).
-func (s *Server) UpdateCatalog(bookPaths []string) []BookMeta {
-	var entries []CatalogEntry
-	holdings := make(map[string]string)
-	var books []BookMeta
-	audiobookCount := 0
+// scanFileResult is one file's worth of UpdateCatalog work, produced by
+// processScanFile so it can run on a worker pool instead of serially.
+type scanFileResult struct {
+	ok          bool // false: unsupported extension or parse failure — skip
+	isAudiobook bool
+	hasTitle    bool // gates holdings/books, same as the old `if title != ""`
+	entry       CatalogEntry
+	book        BookMeta
+}
 
-	for _, p := range bookPaths {
-		ext := strings.ToLower(filepath.Ext(p))
-		var (
-			title, author, isbn, pubDate, coverType string
-			categories                              []string
-			coverData                               []byte
-			narrator, asin                          string
-			durationSecs                            int
-			mediaType                               = "ebook"
-		)
+// processScanFile does the full per-file scan: metadata extraction, cover
+// extraction, and content hashing. Safe to call concurrently across files —
+// it only touches the file at p, a distinct cover path derived from its
+// book ID, and s.hashes (internally locked).
+func (s *Server) processScanFile(p string) scanFileResult {
+	ext := strings.ToLower(filepath.Ext(p))
+	var (
+		title, author, isbn, pubDate, coverType string
+		categories                              []string
+		coverData                               []byte
+		narrator, asin                          string
+		durationSecs                            int
+		mediaType                               = "ebook"
+		isAudiobook                             bool
+	)
 
-		switch ext {
-		case ".epub":
-			meta, err := func() (m epub.Metadata, err error) {
-				defer func() {
-					if r := recover(); r != nil {
-						err = fmt.Errorf("panic: %v", r)
-					}
-				}()
-				return epub.ExtractMetadata(p)
-			}()
-			if err != nil {
-				log.Printf("branch: skipping %s: %v", filepath.Base(p), err)
-				continue
-			}
-			title, author, isbn, pubDate = meta.Title, meta.Author, meta.ISBN, meta.PublishedDate
-			categories = meta.Subjects
-			coverData, coverType = meta.CoverData, meta.CoverType
-		case ".m4b":
-			meta, err := func() (m audiobook.Metadata, err error) {
-				defer func() {
-					if r := recover(); r != nil {
-						err = fmt.Errorf("panic: %v", r)
-					}
-				}()
-				return audiobook.ExtractMetadata(p)
-			}()
-			if err != nil {
-				log.Printf("branch: skipping %s: %v", filepath.Base(p), err)
-				continue
-			}
-			title, author = meta.Title, meta.Author
-			if title == "" {
-				base := strings.TrimSuffix(filepath.Base(p), filepath.Ext(p))
-				// Mirrored audiobooks are named by SHA-256; surfacing that
-				// as a title would be ugly and useless. The audiobook gets
-				// skipped below because title stays empty.
-				if !hashFilenameRe.MatchString(base) {
-					title = base
+	switch ext {
+	case ".epub":
+		meta, err := func() (m epub.Metadata, err error) {
+			defer func() {
+				if r := recover(); r != nil {
+					err = fmt.Errorf("panic: %v", r)
 				}
-			}
-			narrator = meta.Narrator
-			pubDate = meta.Year
-			categories = meta.Genres
-			coverData, coverType = meta.CoverData, meta.CoverType
-			durationSecs = meta.DurationSeconds
-			asin = meta.ASIN
-			mediaType = "audiobook"
-			// iTunes ©day is usually a bare year ("2025"); PostgreSQL's ::date
-			// cast on Town Square rejects that. Expand to YYYY-01-01 so the
-			// sync upsert succeeds.
-			if len(pubDate) == 4 && isAllDigits(pubDate) {
-				pubDate = pubDate + "-01-01"
-			}
-			audiobookCount++
-		default:
-			continue
-		}
-
-		id := bookID(isbn, title, author, mediaType)
-
-		hasCover := false
-		if len(coverData) > 0 {
-			coverExt := ".jpg"
-			if strings.Contains(coverType, "png") {
-				coverExt = ".png"
-			}
-			coverPath := filepath.Join(s.coverDir, id+coverExt)
-			if err := os.WriteFile(coverPath, coverData, 0644); err == nil {
-				hasCover = true
-			}
-		}
-
-		// Compute (or fetch cached) SHA-256 + size. A failure here is
-		// non-fatal: the catalog entry still lands without hash, sync just
-		// won't carry mirror-eligibility data until the next successful pass.
-		size, sha, err := s.hashes.GetOrCompute(p)
+			}()
+			return epub.ExtractMetadata(p)
+		}()
 		if err != nil {
-			log.Printf("branch: hash failed for %s: %v", filepath.Base(p), err)
+			log.Printf("branch: skipping %s: %v", filepath.Base(p), err)
+			return scanFileResult{}
 		}
+		title, author, isbn, pubDate = meta.Title, meta.Author, meta.ISBN, meta.PublishedDate
+		categories = meta.Subjects
+		coverData, coverType = meta.CoverData, meta.CoverType
+	case ".m4b":
+		meta, err := func() (m audiobook.Metadata, err error) {
+			defer func() {
+				if r := recover(); r != nil {
+					err = fmt.Errorf("panic: %v", r)
+				}
+			}()
+			return audiobook.ExtractMetadata(p)
+		}()
+		if err != nil {
+			log.Printf("branch: skipping %s: %v", filepath.Base(p), err)
+			return scanFileResult{}
+		}
+		title, author = meta.Title, meta.Author
+		if title == "" {
+			base := strings.TrimSuffix(filepath.Base(p), filepath.Ext(p))
+			// Mirrored audiobooks are named by SHA-256; surfacing that
+			// as a title would be ugly and useless. The audiobook gets
+			// skipped below because title stays empty.
+			if !hashFilenameRe.MatchString(base) {
+				title = base
+			}
+		}
+		narrator = meta.Narrator
+		pubDate = meta.Year
+		categories = meta.Genres
+		coverData, coverType = meta.CoverData, meta.CoverType
+		durationSecs = meta.DurationSeconds
+		asin = meta.ASIN
+		mediaType = "audiobook"
+		// iTunes ©day is usually a bare year ("2025"); PostgreSQL's ::date
+		// cast on Town Square rejects that. Expand to YYYY-01-01 so the
+		// sync upsert succeeds.
+		if len(pubDate) == 4 && isAllDigits(pubDate) {
+			pubDate = pubDate + "-01-01"
+		}
+		isAudiobook = true
+	default:
+		return scanFileResult{}
+	}
 
-		entry := CatalogEntry{
+	id := bookID(isbn, title, author, mediaType)
+
+	hasCover := false
+	if len(coverData) > 0 {
+		coverExt := ".jpg"
+		if strings.Contains(coverType, "png") {
+			coverExt = ".png"
+		}
+		coverPath := filepath.Join(s.coverDir, id+coverExt)
+		if err := os.WriteFile(coverPath, coverData, 0644); err == nil {
+			hasCover = true
+		}
+	}
+
+	// Compute (or fetch cached) SHA-256 + size. Every book needs this — not
+	// just ones this branch mirrors — because Town Square's mirror-candidate
+	// matching draws source branches from ANY open, connected branch with a
+	// recorded hash, regardless of that branch's own mirror-network setting.
+	// A failure here is non-fatal: the catalog entry still lands without a
+	// hash, sync just won't carry mirror-eligibility data until the next
+	// successful pass.
+	size, sha, err := s.hashes.GetOrCompute(p)
+	if err != nil {
+		log.Printf("branch: hash failed for %s: %v", filepath.Base(p), err)
+	}
+
+	return scanFileResult{
+		ok:          true,
+		isAudiobook: isAudiobook,
+		hasTitle:    title != "",
+		entry: CatalogEntry{
 			Path:     p,
 			Title:    title,
 			Author:   author,
 			ISBN:     isbn,
 			ID:       id,
 			HasCover: hasCover,
+		},
+		book: BookMeta{
+			ISBN:            id,
+			Title:           title,
+			Author:          author,
+			PublishedDate:   pubDate,
+			Categories:      categories,
+			MediaType:       mediaType,
+			Narrator:        narrator,
+			DurationSeconds: durationSecs,
+			FileExt:         ext,
+			ASIN:            asin,
+			ContentSHA256:   sha,
+			SizeBytes:       size,
+			IsMirror:        mirror.IsMirrorPath(p),
+		},
+	}
+}
+
+// scanWorkers bounds how many files UpdateCatalog processes concurrently.
+// Each file does a full-content SHA-256 read plus metadata parsing, so this
+// is tuned as a modest, disk-friendly concurrency level rather than
+// runtime.NumCPU() — most of the cost is I/O, and libraries often live on
+// slower external or network drives where too much parallel I/O just causes
+// thrashing instead of speeding things up.
+const scanWorkers = 8
+
+// UpdateCatalog replaces the current catalog with newly scanned book files.
+// Both .epub (ebook) and .m4b (audiobook) paths are accepted. Returns metadata
+// for all titles (for sync to Town Square). Files are processed concurrently
+// (bounded by scanWorkers) since large libraries — tens of thousands of
+// books — made a fully serial scan take long enough to look hung.
+func (s *Server) UpdateCatalog(bookPaths []string) []BookMeta {
+	results := make([]scanFileResult, len(bookPaths))
+
+	total := len(bookPaths)
+	s.scanTotal.Store(int64(total))
+	s.scanProcessed.Store(0)
+	s.scanning.Store(true)
+	defer s.scanning.Store(false)
+
+	sem := make(chan struct{}, scanWorkers)
+	var wg sync.WaitGroup
+	for i, p := range bookPaths {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(i int, p string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			results[i] = s.processScanFile(p)
+			if n := s.scanProcessed.Add(1); n%500 == 0 || n == int64(total) {
+				log.Printf("branch: scanning — %d/%d file(s) processed", n, total)
+			}
+		}(i, p)
+	}
+	wg.Wait()
+
+	var entries []CatalogEntry
+	holdings := make(map[string]string)
+	var books []BookMeta
+	audiobookCount := 0
+
+	for _, r := range results {
+		if !r.ok {
+			continue
 		}
-		entries = append(entries, entry)
-		if title != "" {
-			holdings[id] = p
-			books = append(books, BookMeta{
-				ISBN:            id,
-				Title:           title,
-				Author:          author,
-				PublishedDate:   pubDate,
-				Categories:      categories,
-				MediaType:       mediaType,
-				Narrator:        narrator,
-				DurationSeconds: durationSecs,
-				FileExt:         ext,
-				ASIN:            asin,
-				ContentSHA256:   sha,
-				SizeBytes:       size,
-				IsMirror:        mirror.IsMirrorPath(p),
-			})
+		if r.isAudiobook {
+			audiobookCount++
+		}
+		entries = append(entries, r.entry)
+		if r.hasTitle {
+			holdings[r.entry.ID] = r.entry.Path
+			books = append(books, r.book)
 		}
 	}
 
@@ -481,6 +681,9 @@ func (s *Server) UpdateCatalog(bookPaths []string) []BookMeta {
 	s.catalog = entries
 	s.holdings = holdings
 	s.mu.Unlock()
+
+	s.hashes.Prune(bookPaths)
+	s.hashes.save()
 
 	log.Printf("branch: catalog updated — %d total, %d audiobook(s)", len(entries), audiobookCount)
 	return books
@@ -503,8 +706,44 @@ func localOnly(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+// tunnelAuth gates remotely-reachable pages behind Basic auth when the
+// request arrived via the public tunnel; local-network requests pass
+// straight through. The credential is a Mayberry user ID (accepted in
+// either Basic-auth field) that must be the owner's own ID or on the
+// branch's shared list. Downloads are NOT gated here — they carry a
+// Town Square JWT instead, and Town Square only issues those to users
+// the branch is shared with.
+func (s *Server) tunnelAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Mayberry-Via-Tunnel") == "" {
+			next(w, r)
+			return
+		}
+		if user, pass, ok := r.BasicAuth(); ok && s.cfg != nil {
+			for _, cand := range []string{user, pass} {
+				cand = strings.ToLower(strings.TrimSpace(cand))
+				if cand == "" {
+					continue
+				}
+				if cand == s.cfg.UserID {
+					next(w, r)
+					return
+				}
+				for _, id := range s.cfg.SharedUsers {
+					if cand == id {
+						next(w, r)
+						return
+					}
+				}
+			}
+		}
+		w.Header().Set("WWW-Authenticate", `Basic realm="Mayberry", charset="UTF-8"`)
+		http.Error(w, "Sign in with your Mayberry user ID as both username and password", 401)
+	}
+}
+
 func (s *Server) routes() {
-	s.mux.HandleFunc("/", s.handleDashboard)
+	s.mux.HandleFunc("/", s.tunnelAuth(s.handleDashboard))
 	s.mux.HandleFunc("/settings", localOnly(s.handleSettingsPage))
 	s.mux.HandleFunc("/api/catalog", localOnly(s.handleCatalog))
 	s.mux.HandleFunc("/api/status", localOnly(s.handleStatus))
@@ -513,10 +752,11 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/restart", localOnly(s.handleRestart))
 	s.mux.HandleFunc("/api/sync", localOnly(s.handleSyncNow))
 	s.mux.HandleFunc("/api/browse", localOnly(s.handleBrowse))
+	s.mux.HandleFunc("/api/guest-card", localOnly(s.handleGuestCard))
 	s.mux.HandleFunc("/api/mirror/status", localOnly(s.handleMirrorStatus))
 	s.mux.HandleFunc("/api/mirror/purge", localOnly(s.handleMirrorPurge))
 	s.mux.HandleFunc("/favicon.ico", s.handleFavicon)
-	s.mux.HandleFunc("/covers/", s.handleLocalCover)
+	s.mux.HandleFunc("/covers/", s.tunnelAuth(s.handleLocalCover))
 	s.mux.HandleFunc("/download/", s.handleDownload)
 }
 
@@ -776,10 +1016,18 @@ document.getElementById('display_name').addEventListener('input', function() {
 </html>`, displayName, displayName, subdomain)
 }
 
+func pluralS(n int) string {
+	if n == 1 {
+		return ""
+	}
+	return "s"
+}
+
 func (s *Server) serveDashboard(w http.ResponseWriter, r *http.Request) {
 	s.mu.RLock()
 	bookCount := len(s.catalog)
 	isbnCount := len(s.holdings)
+	scanWarnings := append([]string(nil), s.scanWarnings...)
 	s.mu.RUnlock()
 
 	branchName := s.branchID
@@ -787,6 +1035,18 @@ func (s *Server) serveDashboard(w http.ResponseWriter, r *http.Request) {
 	if s.cfg != nil {
 		branchName = s.cfg.DisplayName
 		subdomain = s.cfg.Subdomain + ".branch.pub"
+	}
+
+	var warningsHTML string
+	if len(scanWarnings) > 0 {
+		var items strings.Builder
+		for _, w := range scanWarnings {
+			items.WriteString("<li>" + html.EscapeString(w) + "</li>")
+		}
+		warningsHTML = fmt.Sprintf(`<div class="scan-warning">
+    <div class="scan-warning-title">Library scan issue%s</div>
+    <ul>%s</ul>
+  </div>`, pluralS(len(scanWarnings)), items.String())
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -943,6 +1203,58 @@ func (s *Server) serveDashboard(w http.ResponseWriter, r *http.Request) {
     letter-spacing: 0.15em;
     font-family: var(--font-mono);
   }
+  .scan-warning {
+    background: hsl(var(--destructive) / 0.08);
+    border: 1px solid hsl(var(--destructive) / 0.2);
+    border-radius: var(--radius);
+    padding: 0.9rem 1.1rem;
+    margin-bottom: 1.5rem;
+  }
+  .scan-warning-title {
+    font-weight: 600;
+    font-size: 0.85rem;
+    color: hsl(var(--destructive));
+    margin-bottom: 0.4rem;
+  }
+  .scan-warning ul {
+    margin: 0;
+    padding-left: 1.2rem;
+    font-size: 0.8rem;
+    font-family: var(--font-mono);
+    color: hsl(var(--foreground));
+  }
+  .scan-warning li { margin-bottom: 0.2rem; word-break: break-all; }
+  .scan-progress {
+    background: hsl(var(--muted) / 0.5);
+    border: 1px solid hsl(var(--border) / 0.08);
+    border-radius: var(--radius);
+    padding: 0.9rem 1.1rem;
+    margin-bottom: 1.5rem;
+  }
+  .scan-progress-title {
+    font-weight: 600;
+    font-size: 0.85rem;
+    color: hsl(var(--foreground));
+    margin-bottom: 0.55rem;
+  }
+  .scan-progress-bar {
+    background: hsl(var(--border) / 0.25);
+    border-radius: 999px;
+    height: 6px;
+    overflow: hidden;
+  }
+  .scan-progress-fill {
+    background: hsl(var(--primary));
+    height: 100%%;
+    width: 0%%;
+    transition: width 0.3s ease-out;
+  }
+  .scan-progress-text {
+    margin-top: 0.45rem;
+    font-size: 0.78rem;
+    font-family: var(--font-mono);
+    color: hsl(var(--muted-foreground));
+  }
 </style>
 </head>
 <body>
@@ -966,6 +1278,12 @@ func (s *Server) serveDashboard(w http.ResponseWriter, r *http.Request) {
   <div class="subdomain">%s</div>
 </div>
 <div class="container">
+  <div id="scan-progress-banner" class="scan-progress" style="display:none">
+    <div class="scan-progress-title">Indexing library&hellip;</div>
+    <div class="scan-progress-bar"><div id="scan-progress-fill" class="scan-progress-fill"></div></div>
+    <div id="scan-progress-text" class="scan-progress-text"></div>
+  </div>
+  %s
   <div class="stats-grid">
     <div class="stat-card">
       <div class="stat-num">%d</div>
@@ -1000,9 +1318,29 @@ fetch('/api/catalog').then(r=>r.json()).then(books=>{
     ul.appendChild(li);
   });
 });
+
+var sawScanning = false;
+function pollScanStatus(){
+  fetch('/api/status').then(r=>r.json()).then(s=>{
+    var banner = document.getElementById('scan-progress-banner');
+    if (s.scanning) {
+      sawScanning = true;
+      banner.style.display = 'block';
+      var pct = s.scan_total > 0 ? Math.round(100 * s.scan_processed / s.scan_total) : 0;
+      document.getElementById('scan-progress-fill').style.width = pct + '%%';
+      document.getElementById('scan-progress-text').textContent = s.scan_processed + ' / ' + s.scan_total + ' files';
+    } else if (sawScanning) {
+      // Scan just finished — reload to pick up the new book count and catalog.
+      location.reload();
+      return;
+    }
+    setTimeout(pollScanStatus, 1500);
+  }).catch(()=>setTimeout(pollScanStatus, 1500));
+}
+pollScanStatus();
 </script>
 </body>
-</html>`, branchName, branchName, subdomain, bookCount, isbnCount)
+</html>`, branchName, branchName, subdomain, warningsHTML, bookCount, isbnCount)
 }
 
 // --- Setup API ---
@@ -1017,6 +1355,9 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 		LibraryPath   string `json:"library_path"`
 		AudiobookPath string `json:"audiobook_path"`
 		DisplayName   string `json:"display_name"`
+
+		// Sharing allowlist — only applied when present in the request.
+		SharedUsers *[]string `json:"shared_users,omitempty"`
 
 		// Optional mirror settings — only applied when present in the request.
 		// The pointer types let us distinguish "field omitted" from "field set to zero value."
@@ -1098,6 +1439,10 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 	if req.DisplayName != "" {
 		s.cfg.DisplayName = req.DisplayName
 		s.cfg.Subdomain = config.Sanitize(req.DisplayName)
+	}
+
+	if req.SharedUsers != nil {
+		s.cfg.SharedUsers = auth.NormalizeUserIDs(*req.SharedUsers)
 	}
 
 	// Apply mirror settings (validated above).
@@ -1293,12 +1638,13 @@ func (s *Server) handleSettingsPage(w http.ResponseWriter, r *http.Request) {
 	libraryPath := ""
 	audiobookPath := ""
 	subdomain := ""
-	var mirrorHTML string
+	var sharingHTML, mirrorHTML string
 	if s.cfg != nil {
 		displayName = s.cfg.DisplayName
 		libraryPath = s.cfg.LibraryPath
 		audiobookPath = s.cfg.AudiobookPath
 		subdomain = s.cfg.Subdomain
+		sharingHTML = sharingSettingsHTML(s.cfg)
 		mirrorHTML = mirrorSettingsHTML(s.cfg)
 	}
 
@@ -1403,7 +1749,7 @@ func (s *Server) handleSettingsPage(w http.ResponseWriter, r *http.Request) {
       <input type="hidden" id="audiobook_path" name="audiobook_path" value="%s">
       <div id="audiobook_path-picker" class="picker" style="%s"></div>
     </div>
-    %s
+    %s%s
     <button type="submit" class="btn-primary" id="submit-btn">Save Settings</button>
     <button type="button" class="btn-primary btn-accent" id="restart-btn" style="margin-top:0.6rem;display:none;" onclick="restartDaemon()">Restart Now to Apply</button>
   </form>
@@ -1464,6 +1810,7 @@ async function saveSettings(e) {
     library_path: document.getElementById('library_path').value.trim(),
     audiobook_path: document.getElementById('audiobook_path').value.trim(),
     display_name: document.getElementById('display_name').value.trim(),
+    shared_users: splitCSV(document.getElementById('shared_users').value.toLowerCase()),
     mirror_network: document.getElementById('mirror_network').checked,
     mirror_size: document.getElementById('mirror_size').value.trim(),
     mirror_only: splitCSV(document.getElementById('mirror_only').value),
@@ -1485,6 +1832,28 @@ async function saveSettings(e) {
   } catch (err) {
     alert.className = 'alert alert-error'; alert.textContent = err.message; alert.style.display = 'block';
     btn.disabled = false; btn.textContent = 'Save Settings';
+  }
+}
+function copyText(elId, btn) {
+  navigator.clipboard.writeText(document.getElementById(elId).textContent).then(function() {
+    btn.textContent = 'Copied ✓';
+    setTimeout(function() { btn.textContent = 'Copy'; }, 1500);
+  });
+}
+async function createGuestCard() {
+  var btn = document.getElementById('guest-card-btn');
+  btn.disabled = true; btn.textContent = 'Creating...';
+  try {
+    var resp = await fetch('/api/guest-card', { method: 'POST' });
+    var data = await resp.json().catch(function() { return {}; });
+    if (!resp.ok) throw new Error(data.error || 'Could not create guest card');
+    document.getElementById('shared_users').value = (data.shared_users || []).join(', ');
+    document.getElementById('guest-card-id').textContent = data.user_id;
+    document.getElementById('guest-card-result').style.display = 'flex';
+  } catch (err) {
+    alert(err.message);
+  } finally {
+    btn.disabled = false; btn.textContent = 'Create Guest Card';
   }
 }
 async function restartDaemon() {
@@ -1576,7 +1945,100 @@ setInterval(refreshMirrorStatus, 30000);
 </html>`, displayName, subdomain,
 		pickerSelectedStyle(libraryPath), libraryPath, libraryPath, pickerBrowseStyle(libraryPath),
 		pickerSelectedStyle(audiobookPath), audiobookPath, audiobookPath, pickerBrowseStyle(audiobookPath),
-		mirrorHTML)
+		sharingHTML, mirrorHTML)
+}
+
+// sharingSettingsHTML renders the Sharing form section: the owner's own
+// user ID (their identity AND their catalog sign-in credential) plus the
+// editable allowlist of friends' user IDs. Local-only page, so showing
+// the owner's ID here doesn't leak it to remote visitors.
+func sharingSettingsHTML(cfg *config.BranchConfig) string {
+	userID := cfg.UserID
+	if userID == "" {
+		userID = "assigned on first connection to Town Square — check back shortly"
+	}
+	return fmt.Sprintf(`
+    <div class="form-group" style="margin-top:2rem;padding-top:1.5rem;border-top:1px solid hsl(var(--border) / 0.08)">
+      <div style="display:flex;align-items:center;gap:0.6rem;margin-bottom:0.6rem">
+        <strong style="font-size:1rem;color:hsl(var(--foreground));font-family:var(--font-serif);font-weight:600">Sharing</strong>
+      </div>
+      <div style="background:hsl(var(--muted) / 0.5);border:1px solid hsl(var(--border) / 0.06);border-radius:var(--radius);padding:1rem 1.1rem;margin-bottom:1rem">
+        <div style="font-size:0.92rem;color:hsl(var(--foreground));line-height:1.55">
+          Your library is private. Give your user ID to a friend and they can add it below on <em>their</em> branch to share their books with you; add their ID here to share yours. In your reading app, sign in to the catalog with your user ID as <strong>both username and password</strong>.
+        </div>
+      </div>
+      <label>Your User ID</label>
+      <div class="hint">Assigned once, never changes. Share it with friends you trust.</div>
+      <div class="picker-selected" style="margin-bottom:0.9rem"><span id="my-user-id">%s</span><button type="button" class="change-btn" onclick="copyText('my-user-id', this)">Copy</button></div>
+      <label for="shared_users">People with access</label>
+      <div class="hint">Comma-separated user IDs allowed to browse and download from this branch. Remove an ID to revoke access.</div>
+      <input type="text" id="shared_users" value="%s" placeholder="x7k2m9qp4, b3n8w2rty">
+      <label style="margin-top:0.9rem">Guest library card</label>
+      <div class="hint">Friend doesn't have a user ID yet? Create one here — it's added to your access list instantly, so you can just send it to them.</div>
+      <button type="button" class="change-btn" id="guest-card-btn" style="padding:0.45rem 0.9rem;font-size:0.78rem" onclick="createGuestCard()">Create Guest Card</button>
+      <div id="guest-card-result" class="picker-selected" style="display:none;margin-top:0.6rem"><span>New card: <strong id="guest-card-id"></strong></span><button type="button" class="change-btn" onclick="copyText('guest-card-id', this)">Copy</button></div>
+    </div>`, html.EscapeString(userID), html.EscapeString(strings.Join(cfg.SharedUsers, ", ")))
+}
+
+// handleGuestCard mints a reader-only user ID (a "guest library card") via
+// Town Square's public /api/users/new and immediately adds it to this
+// branch's shared list — the owner just sends the ID to a friend and it
+// already works. Local-only: it changes this branch's sharing settings.
+func (s *Server) handleGuestCard(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	if r.Method != http.MethodPost {
+		w.WriteHeader(405)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Method not allowed"})
+		return
+	}
+	if s.cfg == nil {
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Branch not configured yet"})
+		return
+	}
+	serverURL := s.cfg.ServerURL
+	if serverURL == "" {
+		serverURL = config.DefaultServerURL
+	}
+	client := &http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Post(serverURL+"/api/users/new", "application/json", nil)
+	if err != nil {
+		w.WriteHeader(502)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Could not reach Town Square"})
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusTooManyRequests {
+		w.WriteHeader(429)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Town Square is rate-limiting new cards from your address — try again in an hour"})
+		return
+	}
+	var result struct {
+		UserID string `json:"user_id"`
+	}
+	if resp.StatusCode != http.StatusOK || json.NewDecoder(resp.Body).Decode(&result) != nil || result.UserID == "" {
+		w.WriteHeader(502)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Town Square could not create a card"})
+		return
+	}
+
+	s.cfg.SharedUsers = auth.NormalizeUserIDs(append(s.cfg.SharedUsers, result.UserID))
+	if err := config.SaveBranch(s.cfg); err != nil {
+		log.Printf("branch: guest card: save config: %v", err)
+		w.WriteHeader(500)
+		json.NewEncoder(w).Encode(map[string]string{"error": "Card created but saving settings failed — add " + result.UserID + " manually"})
+		return
+	}
+	log.Printf("branch: issued guest card %s", result.UserID)
+	// Kick the setup callback so the updated shared list syncs to Town
+	// Square on the next scan instead of waiting for a library change.
+	if s.onSetup != nil {
+		go s.onSetup(s.cfg)
+	}
+	json.NewEncoder(w).Encode(map[string]any{
+		"user_id":      result.UserID,
+		"shared_users": s.cfg.SharedUsers,
+	})
 }
 
 // mirrorSettingsHTML renders the Network Mirror form section. Kept separate
@@ -1685,11 +2147,15 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	json.NewEncoder(w).Encode(map[string]any{
-		"branch_id":   s.branchID,
-		"book_count":  len(s.catalog),
-		"isbn_count":  len(s.holdings),
-		"needs_setup": s.needsSetup(),
-		"version":     s.version,
+		"branch_id":      s.branchID,
+		"book_count":     len(s.catalog),
+		"isbn_count":     len(s.holdings),
+		"needs_setup":    s.needsSetup(),
+		"version":        s.version,
+		"scan_warnings":  s.scanWarnings,
+		"scanning":       s.scanning.Load(),
+		"scan_processed": s.scanProcessed.Load(),
+		"scan_total":     s.scanTotal.Load(),
 	})
 }
 
