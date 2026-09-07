@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1446,27 +1447,48 @@ func (s *Server) serveDashboard(w http.ResponseWriter, r *http.Request) {
   <div class="section">
     <div class="section-title">Catalog</div>
     <ul class="book-list" id="catalog"></ul>
+    <div id="pager" style="display:none;align-items:center;justify-content:center;gap:1rem;margin-top:1rem">
+      <button type="button" id="pager-prev" style="background:hsl(var(--card));border:1px solid hsl(var(--border) / 0.15);border-radius:var(--radius);padding:0.45rem 1rem;font-size:0.82rem;cursor:pointer;color:hsl(var(--foreground));font-family:var(--font-sans)">&larr; Previous</button>
+      <span id="pager-info" style="font-size:0.78rem;color:hsl(var(--muted-foreground));font-family:var(--font-mono)"></span>
+      <button type="button" id="pager-next" style="background:hsl(var(--card));border:1px solid hsl(var(--border) / 0.15);border-radius:var(--radius);padding:0.45rem 1rem;font-size:0.82rem;cursor:pointer;color:hsl(var(--foreground));font-family:var(--font-sans)">Next &rarr;</button>
+    </div>
   </div>
 </div>
 <div class="footer">Part of the Mayberry Network</div>
 <script>
 var BOOK_GLYPH = `+"`"+bookGlyphSVG+"`"+`;
-fetch('/api/catalog').then(r=>r.json()).then(books=>{
-  const ul=document.getElementById('catalog');
-  if(!books||books.length===0){
-    ul.innerHTML='<div class="empty-state"><div class="empty-icon">'+BOOK_GLYPH+'</div><p>No EPUBs found yet. Add .epub files to your library folder.</p></div>';
-    return;
-  }
-  books.forEach(b=>{
-    const li=document.createElement('li');
-    li.className='book-item';
-    const isbn=b.isbn?'<span class="isbn-badge">'+b.isbn+'</span>':'';
-    var coverKey=b.id||b.isbn||encodeURIComponent(b.path.split('/').pop());
-    var img=b.has_cover?'<img src="/covers/'+coverKey+'" class="book-cover" onerror="this.style.display=\'none\';this.nextSibling.style.display=\'flex\'"><div class="book-icon" style="display:none">'+BOOK_GLYPH+'</div>':'<div class="book-icon">'+BOOK_GLYPH+'</div>';
-    li.innerHTML=img+'<div class="book-info"><div class="book-title">'+(b.title||'Unknown Title')+'</div><div class="book-meta">by '+(b.author||'Unknown')+'</div></div>'+isbn;
-    ul.appendChild(li);
+var catalogPage = 0;
+function loadCatalog(p, scroll){
+  fetch('/api/catalog?page='+Math.max(0,p)).then(r=>r.json()).then(data=>{
+    var books = data.books || [];
+    catalogPage = data.page || 0;
+    const ul=document.getElementById('catalog');
+    ul.innerHTML='';
+    var pager=document.getElementById('pager');
+    if(!data.total){
+      ul.innerHTML='<div class="empty-state"><div class="empty-icon">'+BOOK_GLYPH+'</div><p>No EPUBs found yet. Add .epub files to your library folder.</p></div>';
+      pager.style.display='none';
+      return;
+    }
+    books.forEach(b=>{
+      const li=document.createElement('li');
+      li.className='book-item';
+      const isbn=b.isbn?'<span class="isbn-badge">'+b.isbn+'</span>':'';
+      var coverKey=b.id||b.isbn||encodeURIComponent(b.path.split('/').pop());
+      var img=b.has_cover?'<img src="/covers/'+coverKey+'" class="book-cover" loading="lazy" onerror="this.style.display=\'none\';this.nextSibling.style.display=\'flex\'"><div class="book-icon" style="display:none">'+BOOK_GLYPH+'</div>':'<div class="book-icon">'+BOOK_GLYPH+'</div>';
+      li.innerHTML=img+'<div class="book-info"><div class="book-title">'+(b.title||'Unknown Title')+'</div><div class="book-meta">by '+(b.author||'Unknown')+'</div></div>'+isbn;
+      ul.appendChild(li);
+    });
+    pager.style.display = data.pages > 1 ? 'flex' : 'none';
+    document.getElementById('pager-info').textContent = 'Page ' + (catalogPage+1) + ' of ' + data.pages + ' — ' + data.total + ' books';
+    document.getElementById('pager-prev').disabled = catalogPage <= 0;
+    document.getElementById('pager-next').disabled = catalogPage >= data.pages - 1;
+    if(scroll){ document.getElementById('catalog').scrollIntoView({block:'start'}); }
   });
-});
+}
+document.getElementById('pager-prev').onclick=function(){ loadCatalog(catalogPage-1, true); };
+document.getElementById('pager-next').onclick=function(){ loadCatalog(catalogPage+1, true); };
+loadCatalog(0);
 
 var sawScanning = false;
 function pollScanStatus(){
@@ -2386,11 +2408,43 @@ func pickerBrowseStyle(path string) string {
 	return ""
 }
 
+// handleCatalog returns the scanned catalog. With a ?page=N query it
+// returns one page of catalogPageSize books plus paging info — the
+// dashboard uses this so a 10k-book library doesn't build 10k DOM nodes
+// (and load 10k covers) in one shot. Without the param it returns the
+// full flat array for compatibility with local scripts.
 func (s *Server) handleCatalog(w http.ResponseWriter, r *http.Request) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(s.catalog)
+
+	pageStr := r.URL.Query().Get("page")
+	if pageStr == "" {
+		json.NewEncoder(w).Encode(s.catalog)
+		return
+	}
+
+	const catalogPageSize = 100
+	page, _ := strconv.Atoi(pageStr)
+	total := len(s.catalog)
+	pages := (total + catalogPageSize - 1) / catalogPageSize
+	if page < 0 {
+		page = 0
+	}
+	if pages > 0 && page >= pages {
+		page = pages - 1
+	}
+	start := page * catalogPageSize
+	end := start + catalogPageSize
+	if end > total {
+		end = total
+	}
+	json.NewEncoder(w).Encode(map[string]any{
+		"books": s.catalog[start:end],
+		"total": total,
+		"page":  page,
+		"pages": pages,
+	})
 }
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
