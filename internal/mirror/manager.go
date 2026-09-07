@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/sofriendly/mayberry/internal/auth"
 	"github.com/sofriendly/mayberry/internal/config"
 )
 
@@ -73,7 +74,7 @@ func NewManager(cfg *config.BranchConfig, branchID string) *Manager {
 		cfg:            cfg,
 		branchID:       branchID,
 		townsquare:     cfg.ServerURL,
-		httpClient:     &http.Client{Timeout: 30 * time.Second},
+		httpClient:     &http.Client{Timeout: 30 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }},
 		events:         newEventBuffer(20),
 		audit:          NewAuditLog(DefaultAuditPath()),
 		blacklist:      NewBlacklist(),
@@ -276,6 +277,7 @@ func (m *Manager) fetchCandidates(ctx context.Context) ([]Candidate, error) {
 	if err != nil {
 		return nil, err
 	}
+	req.Header.Set(auth.BranchCredentialHeader, m.cfg.BranchCredential)
 	resp, err := m.httpClient.Do(req)
 	if err != nil {
 		return nil, err
@@ -620,6 +622,7 @@ func (m *Manager) submitReport(ctx context.Context) error {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set(auth.BranchCredentialHeader, m.cfg.BranchCredential)
 	resp, err := m.httpClient.Do(req)
 	if err != nil {
 		return err
@@ -691,4 +694,3 @@ func ratePreset(name string) rateSettings {
 	// slow (and any unknown value) — matches MIRROR.md defaults.
 	return rateSettings{10 * time.Minute, 15 * time.Minute, 500 * 1024}
 }
-

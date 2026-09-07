@@ -14,16 +14,19 @@ import (
 // Per-file caps. Mirror clients reject anything larger before they even
 // start streaming bytes. Values match MIRROR.md security section 2.
 const (
-	MaxEPUBBytes      int64 = 100 * 1024 * 1024       // 100 MB
-	MaxAudiobookBytes int64 = 2 * 1024 * 1024 * 1024  // 2 GB
+	MaxEPUBBytes      int64 = 100 * 1024 * 1024      // 100 MB
+	MaxAudiobookBytes int64 = 2 * 1024 * 1024 * 1024 // 2 GB
 )
 
 // httpClient is the mirror manager's outbound HTTP client. Timeouts are
 // generous enough for slow rural sources but bounded so a stalled peer
 // can't tie up the download goroutine forever.
 var httpClient = &http.Client{
-	Timeout: 30 * time.Minute, // upper bound for the whole transfer
+	Timeout:       30 * time.Minute, // upper bound for the whole transfer
+	CheckRedirect: func(req *http.Request, via []*http.Request) error { return http.ErrUseLastResponse },
 	Transport: &http.Transport{
+		DialContext:           dialPublic,
+		TLSHandshakeTimeout:   15 * time.Second,
 		ResponseHeaderTimeout: 30 * time.Second,
 		IdleConnTimeout:       90 * time.Second,
 		DisableKeepAlives:     false,
@@ -50,6 +53,9 @@ type DownloadResult struct {
 // streamed) we abort with an error — partially-written staging bytes
 // remain for the caller to clean up.
 func Download(ctx context.Context, url string, maxBytes int64, bandwidthBps int64, dst io.Writer) (DownloadResult, error) {
+	if err := validateDownloadURL(url); err != nil {
+		return DownloadResult{}, err
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return DownloadResult{}, fmt.Errorf("mirror: request: %w", err)

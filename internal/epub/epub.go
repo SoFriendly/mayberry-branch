@@ -60,6 +60,20 @@ type opfMeta struct {
 
 var isbn13Re = regexp.MustCompile(`(?:^|[^0-9])(97[89]\d{10})(?:[^0-9]|$)`)
 
+const maxMetadataBytes = 64 << 20
+const maxContentBytes = 16 << 20
+
+func readBounded(r io.Reader, limit int64) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > limit {
+		return nil, fmt.Errorf("EPUB entry exceeds %d bytes", limit)
+	}
+	return data, nil
+}
+
 // ExtractMetadata opens an EPUB file and extracts title, author, and ISBN-13.
 func ExtractMetadata(filepath string) (Metadata, error) {
 	r, err := zip.OpenReader(filepath)
@@ -83,7 +97,7 @@ func ExtractMetadata(filepath string) (Metadata, error) {
 	}
 	defer rc.Close()
 
-	data, err := io.ReadAll(rc)
+	data, err := readBounded(rc, maxMetadataBytes)
 	if err != nil {
 		return Metadata{}, fmt.Errorf("read OPF file: %w", err)
 	}
@@ -141,8 +155,12 @@ func findOPFPath(r *zip.ReadCloser) (string, error) {
 	}
 	defer rc.Close()
 
+	data, err := readBounded(rc, 1<<20)
+	if err != nil {
+		return "", err
+	}
 	var c container
-	if err := xml.NewDecoder(rc).Decode(&c); err != nil {
+	if err := xml.Unmarshal(data, &c); err != nil {
 		return "", fmt.Errorf("parse container.xml: %w", err)
 	}
 	if len(c.Rootfiles) == 0 {
@@ -231,8 +249,11 @@ func scanContentForISBN(r *zip.ReadCloser, opfPath string, pkg opfPackage) strin
 	if err != nil {
 		return ""
 	}
-	data, _ := io.ReadAll(rc)
+	data, readErr := readBounded(rc, maxMetadataBytes)
 	rc.Close()
+	if readErr != nil {
+		return ""
+	}
 
 	var fp fullPkg
 	xml.Unmarshal(data, &fp)
@@ -273,8 +294,11 @@ func scanContentForISBN(r *zip.ReadCloser, opfPath string, pkg opfPackage) strin
 		if err != nil {
 			continue
 		}
-		content, _ := io.ReadAll(rc)
+		content, readErr := readBounded(rc, maxContentBytes)
 		rc.Close()
+		if readErr != nil {
+			continue
+		}
 
 		// Strip HTML tags to get plain text.
 		text := stripTags(string(content))

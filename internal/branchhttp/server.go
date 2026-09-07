@@ -110,9 +110,9 @@ const brandCSSTokens = `
 // a book's metadata re-files it into a new folder.
 type hashCache struct {
 	mu          sync.Mutex
-	entries     map[string]hashEntry     // path -> {size, mtime, hash}
-	bySizeMtime map[sizeMtimeKey]string  // (size, mtime) -> hash, derived from entries
-	path        string                   // disk location for persistence; empty disables it
+	entries     map[string]hashEntry    // path -> {size, mtime, hash}
+	bySizeMtime map[sizeMtimeKey]string // (size, mtime) -> hash, derived from entries
+	path        string                  // disk location for persistence; empty disables it
 }
 
 type hashEntry struct {
@@ -418,19 +418,19 @@ type Server struct {
 	scanTotal     atomic.Int64
 
 	mu           sync.RWMutex
-	catalog      []CatalogEntry // current epub catalog
+	catalog      []CatalogEntry    // current epub catalog
 	holdings     map[string]string // isbn -> filepath
 	scanWarnings []string          // walk errors from the most recent library scan
 
-	cfg            *config.BranchConfig
-	version        string // set by main, surfaced in /api/status for version-aware singleton checks
-	onSetup        SetupCallback
-	onRestart      RestartCallback
-	onShutdown     RestartCallback // same shape as restart, but no restart — used by takeover
-	onSync         SyncCallback
-	onMirrorServe  MirrorServeCallback
-	onMirrorStats  MirrorStatsFn
-	onMirrorPurge  MirrorPurgeFn
+	cfg           *config.BranchConfig
+	version       string // set by main, surfaced in /api/status for version-aware singleton checks
+	onSetup       SetupCallback
+	onRestart     RestartCallback
+	onShutdown    RestartCallback // same shape as restart, but no restart — used by takeover
+	onSync        SyncCallback
+	onMirrorServe MirrorServeCallback
+	onMirrorStats MirrorStatsFn
+	onMirrorPurge MirrorPurgeFn
 }
 
 // CatalogEntry is a scanned epub with its metadata and path.
@@ -531,6 +531,13 @@ func (s *Server) SetMirrorPurgeFn(fn MirrorPurgeFn) {
 // CoverDir returns the directory where extracted cover images are cached.
 func (s *Server) CoverDir() string {
 	return s.coverDir
+}
+
+// SetBranchID updates the serving identity after registration or recovery.
+func (s *Server) SetBranchID(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.branchID = id
 }
 
 func (s *Server) SetPublicKey(pk ed25519.PublicKey) {
@@ -1084,6 +1091,11 @@ func (s *Server) serveSetupWizard(w http.ResponseWriter, r *http.Request) {
   .picker-selected .change-btn:hover { border-color:hsl(var(--primary)); color:hsl(var(--primary)); }
 </style>
 <script>
+function escapeHTML(value) {
+  var span = document.createElement('span');
+  span.textContent = String(value == null ? '' : value);
+  return span.innerHTML;
+}
 async function loadDir(field, path) {
   var url = '/api/browse' + (path ? '?path=' + encodeURIComponent(path) : '');
   var resp = await fetch(url);
@@ -1092,14 +1104,21 @@ async function loadDir(field, path) {
   picker.innerHTML = '';
   var header = document.createElement('div');
   header.className = 'picker-current';
-  var safe = data.current.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
-  header.innerHTML = '<span>' + data.current + '</span><button class="select-btn" onclick="selectFolder(\'' + field + '\', \'' + safe + '\')">Select This Folder</button>';
+
+  var currentLabel = document.createElement('span');
+  currentLabel.textContent = data.current;
+  var selectButton = document.createElement('button');
+  selectButton.type = 'button';
+  selectButton.className = 'select-btn';
+  selectButton.textContent = 'Select This Folder';
+  selectButton.onclick = function() { selectFolder(field, data.current); };
+  header.append(currentLabel, selectButton);
   picker.appendChild(header);
   (data.entries || []).forEach(function(e) {
     if (!e.is_dir) return;
     var row = document.createElement('div');
     row.className = 'picker-row';
-    row.innerHTML = '<span class="icon">' + (e.name === '..' ? '⬆' : '📁') + '</span><span class="name">' + e.name + '</span>';
+    row.innerHTML = '<span class="icon">' + (e.name === '..' ? '⬆' : '📁') + '</span><span class="name">' + escapeHTML(e.name) + '</span>';
     row.onclick = function() { loadDir(field, e.path); };
     picker.appendChild(row);
   });
@@ -1110,7 +1129,7 @@ function selectFolder(field, path) {
   var sel = document.getElementById(field + '-selected');
   sel.style.display = 'flex';
   var clearBtn = field === 'audiobook_path' ? '<button type="button" class="change-btn" style="margin-left:0.4rem;" onclick="clearFolder(\'' + field + '\')">Clear</button>' : '';
-  sel.innerHTML = '<span>' + path + '</span><button type="button" class="change-btn" onclick="changeFolder(\'' + field + '\')">Change</button>' + clearBtn;
+  sel.innerHTML = '<span>' + escapeHTML(path) + '</span><button type="button" class="change-btn" onclick="changeFolder(\'' + field + '\')">Change</button>' + clearBtn;
 }
 function changeFolder(field) {
   document.getElementById(field + '-picker').style.display = '';
@@ -1154,7 +1173,7 @@ document.getElementById('display_name').addEventListener('input', function() {
 });
 </script>
 </body>
-</html>`, displayName, displayName, subdomain)
+</html>`, html.EscapeString(displayName), html.EscapeString(displayName), html.EscapeString(subdomain))
 }
 
 func pluralS(n int) string {
@@ -1171,7 +1190,9 @@ func (s *Server) serveDashboard(w http.ResponseWriter, r *http.Request) {
 	scanWarnings := append([]string(nil), s.scanWarnings...)
 	s.mu.RUnlock()
 
+	s.mu.RLock()
 	branchName := s.branchID
+	s.mu.RUnlock()
 	subdomain := ""
 	if s.cfg != nil {
 		branchName = s.cfg.DisplayName
@@ -1456,6 +1477,11 @@ func (s *Server) serveDashboard(w http.ResponseWriter, r *http.Request) {
 </div>
 <div class="footer">Part of the Mayberry Network</div>
 <script>
+function escapeHTML(value) {
+  var span = document.createElement('span');
+  span.textContent = String(value == null ? '' : value);
+  return span.innerHTML;
+}
 var BOOK_GLYPH = `+"`"+bookGlyphSVG+"`"+`;
 var catalogPage = 0;
 function loadCatalog(p, scroll){
@@ -1473,10 +1499,10 @@ function loadCatalog(p, scroll){
     books.forEach(b=>{
       const li=document.createElement('li');
       li.className='book-item';
-      const isbn=b.isbn?'<span class="isbn-badge">'+b.isbn+'</span>':'';
-      var coverKey=b.id||b.isbn||encodeURIComponent(b.path.split('/').pop());
+      const isbn=b.isbn?'<span class="isbn-badge">'+escapeHTML(b.isbn)+'</span>':'';
+      var coverKey=encodeURIComponent(b.id||b.isbn||b.path.split('/').pop());
       var img=b.has_cover?'<img src="/covers/'+coverKey+'" class="book-cover" loading="lazy" onerror="this.style.display=\'none\';this.nextSibling.style.display=\'flex\'"><div class="book-icon" style="display:none">'+BOOK_GLYPH+'</div>':'<div class="book-icon">'+BOOK_GLYPH+'</div>';
-      li.innerHTML=img+'<div class="book-info"><div class="book-title">'+(b.title||'Unknown Title')+'</div><div class="book-meta">by '+(b.author||'Unknown')+'</div></div>'+isbn;
+      li.innerHTML=img+'<div class="book-info"><div class="book-title">'+escapeHTML(b.title||'Unknown Title')+'</div><div class="book-meta">by '+escapeHTML(b.author||'Unknown')+'</div></div>'+isbn;
       ul.appendChild(li);
     });
     pager.style.display = data.pages > 1 ? 'flex' : 'none';
@@ -1511,7 +1537,7 @@ function pollScanStatus(){
 pollScanStatus();
 </script>
 </body>
-</html>`, branchName, branchName, subdomain, warningsHTML, cardHTML, bookCount, isbnCount)
+</html>`, html.EscapeString(branchName), html.EscapeString(branchName), html.EscapeString(subdomain), warningsHTML, cardHTML, bookCount, isbnCount)
 }
 
 // libraryCardHTML renders the owner's library card panel on the local
@@ -1951,6 +1977,11 @@ func (s *Server) handleSettingsPage(w http.ResponseWriter, r *http.Request) {
   </form>
 </div>
 <script>
+function escapeHTML(value) {
+  var span = document.createElement('span');
+  span.textContent = String(value == null ? '' : value);
+  return span.innerHTML;
+}
 async function loadDir(field, path) {
   var url = '/api/browse' + (path ? '?path=' + encodeURIComponent(path) : '');
   var resp = await fetch(url);
@@ -1959,14 +1990,21 @@ async function loadDir(field, path) {
   picker.innerHTML = '';
   var header = document.createElement('div');
   header.className = 'picker-current';
-  var safeCurrent = data.current.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
-  header.innerHTML = '<span>' + data.current + '</span><button class="select-btn" onclick="selectFolder(\'' + field + '\', \'' + safeCurrent + '\')">Select This Folder</button>';
+
+  var currentLabel = document.createElement('span');
+  currentLabel.textContent = data.current;
+  var selectButton = document.createElement('button');
+  selectButton.type = 'button';
+  selectButton.className = 'select-btn';
+  selectButton.textContent = 'Select This Folder';
+  selectButton.onclick = function() { selectFolder(field, data.current); };
+  header.append(currentLabel, selectButton);
   picker.appendChild(header);
   (data.entries || []).forEach(function(e) {
     if (!e.is_dir) return;
     var row = document.createElement('div');
     row.className = 'picker-row';
-    row.innerHTML = '<span class="icon">' + (e.name === '..' ? '⬆' : '📁') + '</span><span class="name">' + e.name + '</span>';
+    row.innerHTML = '<span class="icon">' + (e.name === '..' ? '⬆' : '📁') + '</span><span class="name">' + escapeHTML(e.name) + '</span>';
     row.onclick = function() { loadDir(field, e.path); };
     picker.appendChild(row);
   });
@@ -1977,7 +2015,7 @@ function selectFolder(field, path) {
   var sel = document.getElementById(field + '-selected');
   sel.style.display = 'flex';
   var clearBtn = field === 'audiobook_path' ? '<button type="button" class="change-btn" style="margin-left:0.4rem;" onclick="clearFolder(\'' + field + '\')">Clear</button>' : '';
-  sel.innerHTML = '<span>' + path + '</span><button type="button" class="change-btn" onclick="changeFolder(\'' + field + '\')">Change</button>' + clearBtn;
+  sel.innerHTML = '<span>' + escapeHTML(path) + '</span><button type="button" class="change-btn" onclick="changeFolder(\'' + field + '\')">Change</button>' + clearBtn;
 }
 function changeFolder(field) {
   document.getElementById(field + '-picker').style.display = '';
@@ -2138,8 +2176,8 @@ async function refreshMirrorStatus() {
       var color = e.kind === 'accepted' ? 'hsl(145 40%% 30%%)' : 'hsl(0 65%% 50%%)';
       var book = e.book_id ? ' ' + e.book_id : '';
       var reason = e.reason ? ' — ' + e.reason : '';
-      li.innerHTML = '<span style="color:' + color + ';font-weight:600;text-transform:uppercase;font-size:0.7rem;letter-spacing:0.08em;font-family:var(--font-mono)">' + e.kind + '</span>' +
-                     book + ' <span style="color:hsl(var(--muted-foreground))">' + relTime(e.at) + '</span>' + reason;
+      li.innerHTML = '<span style="color:' + color + ';font-weight:600;text-transform:uppercase;font-size:0.7rem;letter-spacing:0.08em;font-family:var(--font-mono)">' + escapeHTML(e.kind) + '</span>' +
+                     escapeHTML(book) + ' <span style="color:hsl(var(--muted-foreground))">' + relTime(e.at) + '</span>' + escapeHTML(reason);
       ul.appendChild(li);
     });
   } catch (err) { /* network blips are fine; next interval retries */ }
@@ -2163,9 +2201,9 @@ refreshMirrorStatus();
 setInterval(refreshMirrorStatus, 30000);
 </script>
 </body>
-</html>`, displayName, subdomain,
-		pickerSelectedStyle(libraryPath), libraryPath, libraryPath, pickerBrowseStyle(libraryPath),
-		pickerSelectedStyle(audiobookPath), audiobookPath, audiobookPath, pickerBrowseStyle(audiobookPath),
+</html>`, html.EscapeString(displayName), html.EscapeString(subdomain),
+		pickerSelectedStyle(libraryPath), html.EscapeString(libraryPath), html.EscapeString(libraryPath), pickerBrowseStyle(libraryPath),
+		pickerSelectedStyle(audiobookPath), html.EscapeString(audiobookPath), html.EscapeString(audiobookPath), pickerBrowseStyle(audiobookPath),
 		sharingHTML, mirrorHTML)
 }
 
@@ -2305,7 +2343,7 @@ func (s *Server) handleGuestCard(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(map[string]string{"error": "Card created but saving settings failed — add " + result.UserID + " manually"})
 		return
 	}
-	log.Printf("branch: issued guest card %s", result.UserID)
+	log.Printf("branch: issued guest card")
 	s.triggerShareSync()
 	json.NewEncoder(w).Encode(map[string]any{
 		"user_id":      result.UserID,
@@ -2391,7 +2429,7 @@ func mirrorSettingsHTML(cfg *config.BranchConfig) string {
         <ul id="mirror-events" style="list-style:none;padding:0;margin:0;font-size:0.8rem;color:hsl(var(--foreground))"></ul>
       </div>
       <button type="button" id="mirror-purge-btn" style="margin-top:0.7rem;display:none;background:hsl(var(--accent));color:hsl(var(--accent-foreground));border:none;padding:0.55rem 1rem;border-radius:var(--radius);font-size:0.85rem;font-weight:600;cursor:pointer;font-family:var(--font-sans);transition:background-color 0.15s">Purge mirror</button>
-    </div>`, checked, size, only, ignore, sel("slow"), sel("normal"), sel("fast"), serve)
+    </div>`, checked, html.EscapeString(size), html.EscapeString(only), html.EscapeString(ignore), sel("slow"), sel("normal"), sel("fast"), html.EscapeString(serve))
 }
 
 func pickerSelectedStyle(path string) string {
@@ -2582,6 +2620,11 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.mu.RLock()
+	if s.branchID == "" || claims.BranchID != s.branchID {
+		s.mu.RUnlock()
+		http.Error(w, "Token branch mismatch", http.StatusForbidden)
+		return
+	}
 	filePath, ok := s.holdings[isbn]
 	s.mu.RUnlock()
 

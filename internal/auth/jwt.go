@@ -80,7 +80,7 @@ func VerifyToken(publicKey ed25519.PublicKey, tokenStr string) (*Claims, error) 
 			return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
 		}
 		return publicKey, nil
-	})
+	}, jwt.WithExpirationRequired(), jwt.WithIssuer("mayberry-townsquare"))
 	if err != nil {
 		return nil, fmt.Errorf("verify token: %w", err)
 	}

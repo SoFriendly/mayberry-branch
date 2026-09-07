@@ -12,14 +12,15 @@ import (
 
 // BranchConfig holds local Branch daemon configuration.
 type BranchConfig struct {
-	BranchID      string `json:"branch_id,omitempty"`
-	FriendlyID    string `json:"friendly_id"`
-	DisplayName   string `json:"display_name"`
-	Subdomain     string `json:"subdomain"`
-	LibraryPath   string `json:"library_path"`             // EPUBs
-	AudiobookPath string `json:"audiobook_path,omitempty"` // M4Bs (optional)
-	Port          int    `json:"port"`
-	ServerURL     string `json:"server_url"`
+	BranchCredential string `json:"-"` // separate machine credential; never part of the library card
+	BranchID         string `json:"branch_id,omitempty"`
+	FriendlyID       string `json:"friendly_id"`
+	DisplayName      string `json:"display_name"`
+	Subdomain        string `json:"subdomain"`
+	LibraryPath      string `json:"library_path"`             // EPUBs
+	AudiobookPath    string `json:"audiobook_path,omitempty"` // M4Bs (optional)
+	Port             int    `json:"port"`
+	ServerURL        string `json:"server_url"`
 
 	// Sharing — see the Auth Model section in CLAUDE.md.
 	// UserID is assigned once by Town Square at registration and never
@@ -38,7 +39,6 @@ type BranchConfig struct {
 	MirrorRate      string   `json:"mirror_rate"`       // "slow" | "normal" | "fast"
 	MirrorServeRate string   `json:"mirror_serve_rate"` // outbound cap when serving mirror requests, e.g. "200K"
 }
-
 
 const (
 	DefaultServerURL = "https://mayberry.pub"

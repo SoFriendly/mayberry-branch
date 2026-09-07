@@ -9,3 +9,7 @@ Thumbs.db
 
 # Config (may contain local paths)
 .claude/
+
+# Private audit artifacts
+SECURITY_AUDIT*.md
+security_audit_test.go
