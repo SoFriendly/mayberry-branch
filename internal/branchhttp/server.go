@@ -259,6 +259,111 @@ func (c *hashCache) GetOrCompute(path string) (int64, string, error) {
 	return size, hash, nil
 }
 
+// scanCache memoizes the complete per-file scan result (metadata, cover
+// presence, book ID, hash) keyed by path, invalidated when size or mtime
+// change. The hash cache alone only skipped re-HASHING: every scan tick
+// still re-unzipped and re-parsed every book and re-extracted its cover,
+// so one mirror download — which dirties the watch dir and triggers a
+// rescan — cost a full library's worth of I/O. Persisted next to the
+// hash cache so restarts don't re-parse the world either.
+type scanCache struct {
+	mu      sync.Mutex
+	entries map[string]scanCacheEntry
+	path    string
+}
+
+type scanCacheEntry struct {
+	Size        int64        `json:"size"`
+	Mtime       time.Time    `json:"mtime"`
+	IsAudiobook bool         `json:"is_audiobook"`
+	HasTitle    bool         `json:"has_title"`
+	Entry       CatalogEntry `json:"entry"`
+	Book        BookMeta     `json:"book"`
+}
+
+func newScanCache(path string) *scanCache {
+	c := &scanCache{entries: make(map[string]scanCacheEntry), path: path}
+	if path != "" {
+		if data, err := os.ReadFile(path); err == nil {
+			var entries map[string]scanCacheEntry
+			if err := json.Unmarshal(data, &entries); err == nil {
+				c.entries = entries
+				log.Printf("branch: loaded scan cache (%d entries)", len(entries))
+			} else {
+				log.Printf("branch: scan cache at %s is corrupt, starting fresh: %v", path, err)
+			}
+		}
+	}
+	return c
+}
+
+func (c *scanCache) Get(p string, size int64, mtime time.Time) (scanFileResult, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	e, ok := c.entries[p]
+	if !ok || e.Size != size || !e.Mtime.Equal(mtime) {
+		return scanFileResult{}, false
+	}
+	return scanFileResult{
+		ok:          true,
+		isAudiobook: e.IsAudiobook,
+		hasTitle:    e.HasTitle,
+		entry:       e.Entry,
+		book:        e.Book,
+	}, true
+}
+
+func (c *scanCache) Put(p string, size int64, mtime time.Time, r scanFileResult) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.entries[p] = scanCacheEntry{
+		Size: size, Mtime: mtime,
+		IsAudiobook: r.isAudiobook, HasTitle: r.hasTitle,
+		Entry: r.entry, Book: r.book,
+	}
+}
+
+// Prune drops entries for paths no longer in the library.
+func (c *scanCache) Prune(livePaths []string) {
+	live := make(map[string]bool, len(livePaths))
+	for _, p := range livePaths {
+		live[p] = true
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for p := range c.entries {
+		if !live[p] {
+			delete(c.entries, p)
+		}
+	}
+}
+
+// save persists the cache via temp-file-then-rename, like hashCache.save.
+func (c *scanCache) save() {
+	if c.path == "" {
+		return
+	}
+	c.mu.Lock()
+	entries := make(map[string]scanCacheEntry, len(c.entries))
+	for k, v := range c.entries {
+		entries[k] = v
+	}
+	c.mu.Unlock()
+	data, err := json.Marshal(entries)
+	if err != nil {
+		log.Printf("branch: scan cache marshal failed: %v", err)
+		return
+	}
+	tmp := c.path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0644); err != nil {
+		log.Printf("branch: scan cache save failed: %v", err)
+		return
+	}
+	if err := os.Rename(tmp, c.path); err != nil {
+		log.Printf("branch: scan cache save failed: %v", err)
+	}
+}
+
 // SetupCallback is called after the user completes the web setup wizard.
 // It receives the updated config so the caller can trigger a rescan.
 type SetupCallback func(cfg *config.BranchConfig)
@@ -296,6 +401,7 @@ type Server struct {
 	publicKey  ed25519.PublicKey
 	coverDir   string // cached cover images
 	hashes     *hashCache
+	scans      *scanCache
 
 	// Mirror-serve throttling: size-1 semaphore so we only serve one
 	// mirror request at a time, plus a counter of in-flight real
@@ -342,6 +448,7 @@ func NewServer(branchID, libraryDir string) *Server {
 	coverDir := filepath.Join(home, ".mayberry", "covers")
 	os.MkdirAll(coverDir, 0755)
 	hashCachePath := filepath.Join(home, ".mayberry", "hashcache.json")
+	scanCachePath := filepath.Join(home, ".mayberry", "scancache.json")
 
 	s := &Server{
 		mux:              http.NewServeMux(),
@@ -350,6 +457,7 @@ func NewServer(branchID, libraryDir string) *Server {
 		holdings:         make(map[string]string),
 		coverDir:         coverDir,
 		hashes:           newHashCache(hashCachePath),
+		scans:            newScanCache(scanCachePath),
 		mirrorServeSlots: make(chan struct{}, 1),
 	}
 	s.routes()
@@ -495,6 +603,17 @@ type scanFileResult struct {
 // it only touches the file at p, a distinct cover path derived from its
 // book ID, and s.hashes (internally locked).
 func (s *Server) processScanFile(p string) scanFileResult {
+	// Unchanged files (same size + mtime) come straight from the scan
+	// cache — no unzip, no metadata parse, no cover write, no hashing.
+	var fsize int64
+	var fmtime time.Time
+	if info, err := os.Stat(p); err == nil {
+		fsize, fmtime = info.Size(), info.ModTime()
+		if r, ok := s.scans.Get(p, fsize, fmtime); ok {
+			return r
+		}
+	}
+
 	ext := strings.ToLower(filepath.Ext(p))
 	var (
 		title, author, isbn, pubDate, coverType string
@@ -573,7 +692,14 @@ func (s *Server) processScanFile(p string) scanFileResult {
 			coverExt = ".png"
 		}
 		coverPath := filepath.Join(s.coverDir, id+coverExt)
-		if err := os.WriteFile(coverPath, coverData, 0644); err == nil {
+		// Only write covers that aren't cached yet. They're keyed by book
+		// ID and effectively immutable, and rewriting all of them on every
+		// scan meant each mirror download (which dirties the watch dir and
+		// triggers a full rescan) rewrote the entire cover cache — ~1GB of
+		// disk writes per downloaded book on a large library.
+		if _, statErr := os.Stat(coverPath); statErr == nil {
+			hasCover = true
+		} else if err := os.WriteFile(coverPath, coverData, 0644); err == nil {
 			hasCover = true
 		}
 	}
@@ -590,7 +716,7 @@ func (s *Server) processScanFile(p string) scanFileResult {
 		log.Printf("branch: hash failed for %s: %v", filepath.Base(p), err)
 	}
 
-	return scanFileResult{
+	res := scanFileResult{
 		ok:          true,
 		isAudiobook: isAudiobook,
 		hasTitle:    title != "",
@@ -618,6 +744,17 @@ func (s *Server) processScanFile(p string) scanFileResult {
 			IsMirror:        mirror.IsMirrorPath(p),
 		},
 	}
+	if fmtime.IsZero() {
+		// The pre-parse stat failed but the file parsed anyway; stat again
+		// so the cache key reflects the file we actually read.
+		if info, err := os.Stat(p); err == nil {
+			fsize, fmtime = info.Size(), info.ModTime()
+		}
+	}
+	if !fmtime.IsZero() {
+		s.scans.Put(p, fsize, fmtime, res)
+	}
+	return res
 }
 
 // scanWorkers bounds how many files UpdateCatalog processes concurrently.
@@ -684,6 +821,8 @@ func (s *Server) UpdateCatalog(bookPaths []string) []BookMeta {
 
 	s.hashes.Prune(bookPaths)
 	s.hashes.save()
+	s.scans.Prune(bookPaths)
+	s.scans.save()
 
 	log.Printf("branch: catalog updated — %d total, %d audiobook(s)", len(entries), audiobookCount)
 	return books
