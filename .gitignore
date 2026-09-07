@@ -9,3 +9,7 @@ Thumbs.db
 
 # Config (may contain local paths)
 .claude/
+
+# Docker
+.env
+data/

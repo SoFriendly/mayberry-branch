@@ -23,6 +23,10 @@ irm https://mayberry.pub/install.ps1 | iex
 go build -o mayberry ./cmd/branch
 ```
 
+**Docker:**
+
+See [docker/README.md](docker/README.md) for running Mayberry via `docker compose`, fully configured through environment variables.
+
 ## Usage
 
 ```sh
