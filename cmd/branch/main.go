@@ -352,8 +352,8 @@ func startBackgroundServices(ctx context.Context, cfg *config.BranchConfig, hubU
 func startFullServices(ctx context.Context, cfg *config.BranchConfig, hubURL string, state *sharedState, alog *activityLog, branchSrv *branchhttp.Server, swap *handlerSwap) {
 	// Register with Town Square
 	alog.Add("Registering with Town Square...")
-	branchID := register(cfg)
-	if branchID != "" {
+	branchID, registered := registerOrRetainIdentity(cfg)
+	if registered {
 		branchSrv = branchhttp.NewServer(branchID, cfg.LibraryPath)
 		branchSrv.SetConfig(cfg)
 		branchSrv.SetVersion(Version)
@@ -371,7 +371,8 @@ func startFullServices(ctx context.Context, cfg *config.BranchConfig, hubURL str
 		alog.Add(fmt.Sprintf("Registered with Town Square (id: %s)", branchID))
 	} else {
 		state.setStatus("townsquare", "error")
-		alog.Add("Town Square registration failed")
+		alog.Add("Town Square registration failed — retaining saved branch identity")
+		branchSrv.SetBranchID(branchID)
 	}
 
 	// Restart callback is local-only — it doesn't need branchID or a
@@ -565,6 +566,14 @@ func startFullServices(ctx context.Context, cfg *config.BranchConfig, hubURL str
 
 // httpClient is used for all Town Square API calls.
 var httpClient = &http.Client{Timeout: 15 * time.Second}
+
+// A timeout must not replace the saved identity with an empty runtime ID.
+func registerOrRetainIdentity(cfg *config.BranchConfig) (string, bool) {
+	if id := register(cfg); id != "" {
+		return id, true
+	}
+	return cfg.BranchID, false
+}
 
 func register(cfg *config.BranchConfig) string {
 	if err := config.EnsureBranchCredential(cfg); err != nil {

@@ -38,3 +38,18 @@ func TestRegistrationSilentlyEnrollsSavedIdentity(t *testing.T) {
 		t.Fatal("automatic enrollment changed existing configuration")
 	}
 }
+
+func TestRegistrationFailureRetainsSavedIdentity(t *testing.T) {
+	secret, _ := auth.NewBranchCredential()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { http.Error(w, "temporarily unavailable", 503) }))
+	defer server.Close()
+	cfg := &config.BranchConfig{BranchID: "saved-branch", UserID: "123456789", BranchCredential: secret, ServerURL: server.URL}
+	id, registered := registerOrRetainIdentity(cfg)
+	if registered || id != "saved-branch" || cfg.BranchID != "saved-branch" || cfg.UserID != "123456789" {
+		t.Fatal("registration failure discarded saved identity")
+	}
+	cfg.BranchID = ""
+	if id, ok := registerOrRetainIdentity(cfg); id != "" || ok {
+		t.Fatal("invented identity for new installation")
+	}
+}
