@@ -42,7 +42,7 @@ func TestCatalogPreferencesProxyAndTunnelIsolation(t *testing.T) {
 			t.Fatal("proxy failed or exposed card")
 		}
 	}
-	for _, path := range []string{"/catalog-settings", "/api/feed-preferences"} {
+	for _, path := range []string{"/catalog-settings", "/api/feed-preferences", "/api/sharing", "/api/guest-card"} {
 		r := httptest.NewRequest("GET", path, nil)
 		r.Header.Set("X-Mayberry-Via-Tunnel", "true")
 		w := httptest.NewRecorder()
@@ -65,7 +65,7 @@ func TestCatalogPreferencesProxyAndTunnelIsolation(t *testing.T) {
 	r = httptest.NewRequest("GET", "/catalog-settings", nil)
 	w = httptest.NewRecorder()
 	s.ServeHTTP(w, r)
-	if w.Code != 200 || !strings.Contains(w.Body.String(), "My catalog") || strings.Contains(w.Body.String(), "123456789") {
-		t.Fatal("settings page missing or contains card")
+	if w.Code != 200 || !strings.Contains(w.Body.String(), "My catalog") || !strings.Contains(w.Body.String(), "Friends and sharing") {
+		t.Fatal("local settings page missing")
 	}
 }

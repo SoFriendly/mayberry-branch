@@ -22,5 +22,8 @@ func TestExportSettingsPage(t *testing.T) {
 		if err := os.WriteFile(path, []byte(Page("/api/feed-preferences")), 0600); err != nil {
 			t.Fatal(err)
 		}
+		if err := os.WriteFile(path+".local", []byte(LocalPage("/api/feed-preferences", "123456789", []string{"987654321"})), 0600); err != nil {
+			t.Fatal(err)
+		}
 	}
 }

@@ -18,7 +18,11 @@ func (s *Server) handleCatalogSettings(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
-	fmt.Fprint(w, feedprefs.Page("/api/feed-preferences"))
+	if s.cfg == nil {
+		fmt.Fprint(w, feedprefs.Page("/api/feed-preferences"))
+		return
+	}
+	fmt.Fprint(w, feedprefs.LocalPage("/api/feed-preferences", s.cfg.UserID, s.cfg.SharedUsers))
 }
 
 // The browser never receives the card in JavaScript. Local settings use the
