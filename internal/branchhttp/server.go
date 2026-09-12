@@ -890,6 +890,8 @@ func (s *Server) tunnelAuth(next http.HandlerFunc) http.HandlerFunc {
 }
 
 func (s *Server) routes() {
+	s.mux.HandleFunc("/catalog-settings", localOnly(s.handleCatalogSettings))
+	s.mux.HandleFunc("/api/feed-preferences", localOnly(s.handleFeedPreferences))
 	s.mux.HandleFunc("/", s.tunnelAuth(s.handleDashboard))
 	s.mux.HandleFunc("/settings", localOnly(s.handleSettingsPage))
 	s.mux.HandleFunc("/api/catalog", localOnly(s.handleCatalog))
@@ -1946,6 +1948,7 @@ func (s *Server) handleSettingsPage(w http.ResponseWriter, r *http.Request) {
     </div>
   </div>
   <h1>Branch Settings</h1>
+  <p><a href="/catalog-settings">My catalog — filter branches, mirrors, file size and languages</a></p>
   <p class="subtitle">Update your branch name or library folder. Changes take effect immediately.</p>
 
   <div id="alert" class="alert alert-error"></div>

@@ -49,6 +49,8 @@ Mayberry installs as a background service and runs automatically on login.
 
 Open `http://localhost:1950/settings` anytime to change your branch name or library folder.
 
+Choose **My catalog** to include or exclude branches, hide mirrored copies, limit file size, and filter languages. These preferences follow your library card across catalog browsing, search, and downloads; they do not change the books your branch stores or shares. Reader-only users can use [catalog settings](https://mayberry.pub/settings), signing in with their card as both username and password.
+
 ## How It Works
 
 Your branch connects **outbound** to the Mayberry network through an encrypted WebSocket tunnel. No ports are opened on your machine. Your IP is never exposed.
