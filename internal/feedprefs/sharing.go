@@ -25,12 +25,12 @@ func SharingPage(endpoint, userID string, sharedUsers []string) string {
 </section>
 <script>
 async function sharingRequest(path,body){
- const r=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+ const r=await settingsFetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
  const data=await r.json().catch(()=>({}));if(!r.ok)throw Error(data.error||'Could not save sharing. Try again.');return data;
 }
 el('copy-card').onclick=async()=>{try{await navigator.clipboard.writeText(el('my-card').textContent);el('sharing-status').textContent='Card copied.'}catch(e){el('sharing-status').textContent='Select your card number above to copy it.'}};
 el('sharing-fields').disabled=true;
-fetch('/api/sharing',{cache:'no-store'}).then(async r=>{if(!r.ok)throw Error('Could not load sharing. Reload to try again.');const d=await r.json();el('shared-users').value=(d.shared_users||[]).join(', ');el('sharing-fields').disabled=false;}).catch(e=>{el('sharing-status').textContent=e.message});
+settingsFetch('/api/sharing',{cache:'no-store'}).then(async r=>{if(!r.ok)throw Error('Could not load sharing. Reload to try again.');const d=await r.json();el('shared-users').value=(d.shared_users||[]).join(', ');el('sharing-fields').disabled=false;}).catch(e=>{el('sharing-status').textContent=e.message});
 el('sharing-form').onsubmit=async e=>{
  e.preventDefault();el('sharing-fields').disabled=true;el('sharing-status').textContent='Saving sharing…';
  try{const d=await sharingRequest('/api/sharing',{shared_users:el('shared-users').value.toLowerCase().split(',').map(x=>x.trim()).filter(Boolean)});el('shared-users').value=(d.shared_users||[]).join(', ');el('sharing-status').textContent='Sharing saved. Refresh your catalog to see the changes.';}
