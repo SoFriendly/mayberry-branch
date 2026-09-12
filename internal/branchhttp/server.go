@@ -856,8 +856,8 @@ func localOnly(next http.HandlerFunc) http.HandlerFunc {
 // tunnelAuth gates remotely-reachable pages behind Basic auth when the
 // request arrived via the public tunnel; local-network requests pass
 // straight through. The credential is a Mayberry user ID (accepted in
-// either Basic-auth field) that must be the owner's own ID or on the
-// branch's shared list. Downloads are NOT gated here — they carry a
+// either Basic-auth field). Owners pass locally; other cards are checked
+// against Town Square's current mutual sharing rules. Downloads carry a
 // Town Square JWT instead, and Town Square only issues those to users
 // the branch is shared with.
 func (s *Server) tunnelAuth(next http.HandlerFunc) http.HandlerFunc {
@@ -876,14 +876,21 @@ func (s *Server) tunnelAuth(next http.HandlerFunc) http.HandlerFunc {
 					next(w, r)
 					return
 				}
-				for _, id := range s.cfg.SharedUsers {
-					if cand == id {
-						next(w, r)
-						return
-					}
-				}
+
 			}
 		}
+		if _, _, ok := r.BasicAuth(); ok && s.cfg != nil {
+			allowed, err := s.remoteBranchAccess(r)
+			if err != nil {
+				http.Error(w, "Sharing service unavailable. Try again shortly.", 503)
+				return
+			}
+			if allowed {
+				next(w, r)
+				return
+			}
+		}
+
 		w.Header().Set("WWW-Authenticate", `Basic realm="Mayberry", charset="UTF-8"`)
 		http.Error(w, "Sign in with your Mayberry user ID as both username and password", 401)
 	}
@@ -2047,7 +2054,6 @@ async function saveSettings(e) {
     library_path: document.getElementById('library_path').value.trim(),
     audiobook_path: document.getElementById('audiobook_path').value.trim(),
     display_name: document.getElementById('display_name').value.trim(),
-    shared_users: splitCSV(document.getElementById('shared_users').value.toLowerCase()),
     mirror_network: document.getElementById('mirror_network').checked,
     mirror_size: document.getElementById('mirror_size').value.trim(),
     mirror_only: splitCSV(document.getElementById('mirror_only').value),
@@ -2056,6 +2062,11 @@ async function saveSettings(e) {
     mirror_serve_rate: document.getElementById('mirror_serve_rate').value.trim()
   };
   try {
+    if (sharingLoaded && document.getElementById('shared_users').value !== sharingBaseline) {
+      var sharingResp = await fetch('/api/sharing', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({shared_users:splitCSV(document.getElementById('shared_users').value.toLowerCase())})});
+      if (!sharingResp.ok) throw new Error('Could not save sharing. Try again.');
+      sharingBaseline = document.getElementById('shared_users').value;
+    }
     var resp = await fetch('/api/setup', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body) });
     var data = await resp.json();
     if (!resp.ok) throw new Error(data.error || 'Save failed');
@@ -2077,6 +2088,21 @@ function copyText(elId, btn) {
     setTimeout(function() { btn.textContent = 'Copy'; }, 1500);
   });
 }
+var sharingLoaded=false, sharingBaseline='';
+if (document.getElementById('shared_users')) {
+ document.getElementById('shared_users').disabled=true;
+ document.getElementById('sharing-save-btn').disabled=true;
+ document.getElementById('guest-card-btn').disabled=true;
+ fetch('/api/sharing',{cache:'no-store'}).then(async function(r){
+  if(!r.ok)throw new Error('Could not load sharing. Reload to try again.');
+  var d=await r.json();sharingBaseline=(d.shared_users||[]).join(', ');
+  document.getElementById('shared_users').value=sharingBaseline;
+  sharingLoaded=true;
+  document.getElementById('shared_users').disabled=false;
+  document.getElementById('sharing-save-btn').disabled=false;
+  document.getElementById('guest-card-btn').disabled=false;
+ }).catch(function(e){var status=document.getElementById('sharing-status');status.textContent=e.message;status.style.display='block';});
+}
 async function saveSharing() {
   var btn = document.getElementById('sharing-save-btn');
   var status = document.getElementById('sharing-status');
@@ -2091,8 +2117,9 @@ async function saveSharing() {
     var data = await resp.json().catch(function() { return {}; });
     if (!resp.ok) throw new Error(data.error || 'Save failed');
     document.getElementById('shared_users').value = (data.shared_users || []).join(', ');
+    sharingBaseline = document.getElementById('shared_users').value;
     status.style.color = 'hsl(var(--success))';
-    status.textContent = 'Sharing saved — syncing to the network now.';
+    status.textContent = 'Sharing saved. Refresh your catalog to see the changes.';
     status.style.display = 'block';
   } catch (err) {
     status.style.color = 'hsl(var(--destructive))';
@@ -2106,10 +2133,11 @@ async function createGuestCard() {
   var btn = document.getElementById('guest-card-btn');
   btn.disabled = true; btn.textContent = 'Creating...';
   try {
-    var resp = await fetch('/api/guest-card', { method: 'POST' });
+    var resp = await fetch('/api/guest-card', { method: 'POST', headers:{'Content-Type':'application/json'}, body:'{}' });
     var data = await resp.json().catch(function() { return {}; });
     if (!resp.ok) throw new Error(data.error || 'Could not create guest card');
     document.getElementById('shared_users').value = (data.shared_users || []).join(', ');
+    sharingBaseline = document.getElementById('shared_users').value;
     document.getElementById('guest-card-id').textContent = data.user_id;
     document.getElementById('guest-card-result').style.display = 'flex';
   } catch (err) {
@@ -2259,99 +2287,13 @@ func (s *Server) triggerShareSync() {
 	}
 }
 
-// handleSharing saves just the sharing allowlist and syncs it to Town
-// Square right away — the Sharing section's own Save button posts here
-// so access changes don't ride on (or wait for) the full settings form.
+// handleSharing forwards local settings to the authoritative account list.
 func (s *Server) handleSharing(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	if r.Method != http.MethodPost {
-		w.WriteHeader(405)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Method not allowed"})
-		return
-	}
-	if s.cfg == nil {
-		w.WriteHeader(500)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Branch not configured yet"})
-		return
-	}
-	var req struct {
-		SharedUsers []string `json:"shared_users"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		w.WriteHeader(400)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Invalid JSON"})
-		return
-	}
-	s.cfg.SharedUsers = auth.NormalizeUserIDs(req.SharedUsers)
-	if err := config.SaveBranch(s.cfg); err != nil {
-		log.Printf("branch: save sharing: %v", err)
-		w.WriteHeader(500)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Failed to save configuration"})
-		return
-	}
-	log.Printf("branch: sharing updated — %d user(s)", len(s.cfg.SharedUsers))
-	s.triggerShareSync()
-	json.NewEncoder(w).Encode(map[string]any{
-		"status":       "ok",
-		"shared_users": s.cfg.SharedUsers,
-	})
+	s.proxyReaderSharing(w, r, "/api/sharing")
 }
 
-// handleGuestCard mints a reader-only user ID (a "guest library card") via
-// Town Square's public /api/users/new and immediately adds it to this
-// branch's shared list — the owner just sends the ID to a friend and it
-// already works. Local-only: it changes this branch's sharing settings.
 func (s *Server) handleGuestCard(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	if r.Method != http.MethodPost {
-		w.WriteHeader(405)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Method not allowed"})
-		return
-	}
-	if s.cfg == nil {
-		w.WriteHeader(500)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Branch not configured yet"})
-		return
-	}
-	serverURL := s.cfg.ServerURL
-	if serverURL == "" {
-		serverURL = config.DefaultServerURL
-	}
-	client := &http.Client{Timeout: 15 * time.Second}
-	resp, err := client.Post(serverURL+"/api/users/new", "application/json", nil)
-	if err != nil {
-		w.WriteHeader(502)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Could not reach Town Square"})
-		return
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusTooManyRequests {
-		w.WriteHeader(429)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Town Square is rate-limiting new cards from your address — try again in an hour"})
-		return
-	}
-	var result struct {
-		UserID string `json:"user_id"`
-	}
-	if resp.StatusCode != http.StatusOK || json.NewDecoder(resp.Body).Decode(&result) != nil || result.UserID == "" {
-		w.WriteHeader(502)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Town Square could not create a card"})
-		return
-	}
-
-	s.cfg.SharedUsers = auth.NormalizeUserIDs(append(s.cfg.SharedUsers, result.UserID))
-	if err := config.SaveBranch(s.cfg); err != nil {
-		log.Printf("branch: guest card: save config: %v", err)
-		w.WriteHeader(500)
-		json.NewEncoder(w).Encode(map[string]string{"error": "Card created but saving settings failed — add " + result.UserID + " manually"})
-		return
-	}
-	log.Printf("branch: issued guest card")
-	s.triggerShareSync()
-	json.NewEncoder(w).Encode(map[string]any{
-		"user_id":      result.UserID,
-		"shared_users": s.cfg.SharedUsers,
-	})
+	s.proxyReaderSharing(w, r, "/api/guest-card")
 }
 
 // mirrorSettingsHTML renders the Network Mirror form section. Kept separate

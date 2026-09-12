@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/sofriendly/mayberry/internal/config"
 	"github.com/sofriendly/mayberry/internal/feedprefs"
 )
 
@@ -60,4 +61,70 @@ func (s *Server) handleFeedPreferences(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(resp.StatusCode)
 	io.Copy(w, io.LimitReader(resp.Body, 1<<20))
+}
+
+// Sharing requests use only the saved card and fixed Town Square paths. The
+// local-only route wrapper still prevents access through the public tunnel.
+func (s *Server) proxyReaderSharing(w http.ResponseWriter, r *http.Request, path string) {
+	if r.Method != http.MethodPost && !(path == "/api/sharing" && r.Method == http.MethodGet) {
+		http.Error(w, "Method not allowed", 405)
+		return
+	}
+	if s.cfg == nil || s.cfg.UserID == "" {
+		http.Error(w, "Register your branch before editing sharing", 409)
+		return
+	}
+	origin, err := url.Parse(r.Header.Get("Origin"))
+	if r.Method == http.MethodPost && (r.Header.Get("Content-Type") != "application/json" || r.Header.Get("Sec-Fetch-Site") == "cross-site" || (r.Header.Get("Origin") != "" && (err != nil || origin.Host != r.Host))) {
+		http.Error(w, "Invalid sharing request", 403)
+		return
+	}
+	serverURL := s.cfg.ServerURL
+	if serverURL == "" {
+		serverURL = config.DefaultServerURL
+	}
+	req, err := http.NewRequestWithContext(r.Context(), r.Method, strings.TrimRight(serverURL, "/")+path, http.MaxBytesReader(w, r.Body, 64<<10))
+	if err != nil {
+		http.Error(w, "Invalid catalog server", 502)
+		return
+	}
+	req.SetBasicAuth(s.cfg.UserID, s.cfg.UserID)
+	req.Header.Set("Content-Type", "application/json")
+	client := &http.Client{Timeout: 15 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	resp, err := client.Do(req)
+	if err != nil {
+		http.Error(w, "Catalog server unavailable. Try again shortly.", 502)
+		return
+	}
+	defer resp.Body.Close()
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
+	w.WriteHeader(resp.StatusCode)
+	io.Copy(w, io.LimitReader(resp.Body, 1<<20))
+}
+
+func (s *Server) remoteBranchAccess(r *http.Request) (bool, error) {
+	serverURL := s.cfg.ServerURL
+	if serverURL == "" {
+		serverURL = config.DefaultServerURL
+	}
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, strings.TrimRight(serverURL, "/")+"/api/branch-access?branch_id="+url.QueryEscape(s.branchID), nil)
+	if err != nil {
+		return false, err
+	}
+	user, pass, _ := r.BasicAuth()
+	req.SetBasicAuth(user, pass)
+	client := &http.Client{Timeout: 5 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	resp, err := client.Do(req)
+	if err != nil {
+		return false, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == 401 || resp.StatusCode == 403 {
+		return false, nil
+	}
+	if resp.StatusCode != http.StatusNoContent {
+		return false, fmt.Errorf("sharing service status %d", resp.StatusCode)
+	}
+	return true, nil
 }

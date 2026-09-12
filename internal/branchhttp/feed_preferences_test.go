@@ -69,3 +69,69 @@ func TestCatalogPreferencesProxyAndTunnelIsolation(t *testing.T) {
 		t.Fatal("local settings page missing")
 	}
 }
+
+func TestSharingProxyAndCrossOriginIsolation(t *testing.T) {
+	calls := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		u, p, ok := r.BasicAuth()
+		if !ok || u != "123456789" || p != u {
+			t.Error("missing saved card")
+		}
+		if r.URL.Path != "/api/sharing" && r.URL.Path != "/api/guest-card" {
+			t.Error("unexpected path")
+		}
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"shared_users":["987654321"]}`)
+	}))
+	defer upstream.Close()
+	s := NewServer("branch", t.TempDir())
+	s.SetConfig(&config.BranchConfig{UserID: "123456789", ServerURL: upstream.URL})
+	for _, path := range []string{"/api/sharing", "/api/guest-card"} {
+		for _, blocked := range []bool{false, true} {
+			r := httptest.NewRequest("POST", path, strings.NewReader(`{"shared_users":[]}`))
+			r.Header.Set("Content-Type", "application/json")
+			if blocked {
+				r.Header.Set("Origin", "https://evil.example")
+			}
+			w := httptest.NewRecorder()
+			s.ServeHTTP(w, r)
+			want := 200
+			if blocked {
+				want = 403
+			}
+			if w.Code != want {
+				t.Fatal(path, w.Code)
+			}
+		}
+	}
+	if calls != 2 {
+		t.Fatal("blocked write reached upstream")
+	}
+}
+
+func TestTunnelUsesCurrentSharing(t *testing.T) {
+	status := http.StatusNoContent
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		user, _, _ := r.BasicAuth()
+		if user != "987654321" || r.URL.Path != "/api/branch-access" || r.URL.Query().Get("branch_id") != "branch" {
+			t.Error("wrong sharing check")
+		}
+		w.WriteHeader(status)
+	}))
+	defer upstream.Close()
+	s := NewServer("branch", t.TempDir())
+	s.SetConfig(&config.BranchConfig{UserID: "123456789", SharedUsers: []string{"987654321"}, ServerURL: upstream.URL})
+	handler := s.tunnelAuth(func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(204) })
+	for _, test := range []struct{ upstream, want int }{{204, 204}, {403, 401}, {500, 503}} {
+		status = test.upstream
+		r := httptest.NewRequest("GET", "/", nil)
+		r.Header.Set("X-Mayberry-Via-Tunnel", "true")
+		r.SetBasicAuth("987654321", "987654321")
+		w := httptest.NewRecorder()
+		handler(w, r)
+		if w.Code != test.want {
+			t.Fatal("stale local list used or sharing check failed", w.Code)
+		}
+	}
+}
