@@ -901,7 +901,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/feed-preferences", localOnly(s.handleFeedPreferences))
 	s.mux.HandleFunc("/", s.tunnelAuth(s.handleDashboard))
 	s.mux.HandleFunc("/settings", localOnly(s.handleSettingsPage))
-	s.mux.HandleFunc("/api/catalog", localOnly(s.handleCatalog))
+	s.mux.HandleFunc("/api/catalog", s.handleCatalog)
 	s.mux.HandleFunc("/api/status", localOnly(s.handleStatus))
 	s.mux.HandleFunc("/api/shutdown", localOnly(s.handleShutdown))
 	s.mux.HandleFunc("/api/setup", localOnly(s.handleSetup))
