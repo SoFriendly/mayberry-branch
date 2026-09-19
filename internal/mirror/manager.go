@@ -46,6 +46,7 @@ type Manager struct {
 	events    *eventBuffer
 	audit     *AuditLog
 	blacklist *Blacklist
+	rejects   *RejectMemory
 
 	// reportCounters accumulates per-source reject counts and reasons
 	// since the last submission to Town Square. The submitter goroutine
@@ -78,6 +79,7 @@ func NewManager(cfg *config.BranchConfig, branchID string) *Manager {
 		events:         newEventBuffer(20),
 		audit:          NewAuditLog(DefaultAuditPath()),
 		blacklist:      NewBlacklist(),
+		rejects:        NewRejectMemory(DefaultRejectsPath()),
 		reportCounters: make(map[string]*sourceReport),
 	}
 }
@@ -191,6 +193,13 @@ func (m *Manager) tick(ctx context.Context, bandwidth int64) error {
 		if m.blacklist != nil && m.blacklist.IsBlocked(cands[i].SourceBranchID) {
 			continue
 		}
+		// Skip candidates already permanently rejected under the same
+		// announced hash — deterministic failures never heal by retry,
+		// only by the source re-syncing a different hash (which changes
+		// the key and makes the book eligible again).
+		if m.rejects != nil && m.rejects.Skip(cands[i]) {
+			continue
+		}
 		picked = &cands[i]
 		break
 	}
@@ -199,7 +208,7 @@ func (m *Manager) tick(ctx context.Context, bandwidth int64) error {
 	}
 	cand := *picked
 	if err := m.processCandidate(ctx, cand, bandwidth); err != nil {
-		m.recordReject(cand, err.Error())
+		m.recordReject(cand, err)
 		return err
 	}
 	m.recordAccept(cand)
@@ -207,9 +216,16 @@ func (m *Manager) tick(ctx context.Context, bandwidth int64) error {
 }
 
 // recordReject fans the rejection out to dashboard events, the audit
-// log file, the blacklist counter, and the periodic report aggregator.
-// One call site, one place to keep these in sync.
-func (m *Manager) recordReject(c Candidate, reason string) {
+// log file, the blacklist counter, the permanent-reject memory, and the
+// periodic report aggregator. One call site, one place to keep these in
+// sync.
+func (m *Manager) recordReject(c Candidate, err error) {
+	reason := err.Error()
+	if m.rejects != nil {
+		if _, permanent := err.(permanentReject); permanent {
+			m.rejects.Record(c)
+		}
+	}
 	ev := Event{
 		At:             LogTime(),
 		Kind:           "rejected",
@@ -271,6 +287,13 @@ func (m *Manager) fetchCandidates(ctx context.Context) ([]Candidate, error) {
 	if len(m.cfg.MirrorIgnore) > 0 {
 		q.Set("ignore", strings.Join(m.cfg.MirrorIgnore, ","))
 	}
+	// Only ask for audiobooks if we have somewhere to put them; otherwise
+	// we'd download a multi-GB M4B and reject it for lack of a dir.
+	if m.audiobookRoot != "" {
+		q.Set("media", "ebook,audiobook")
+	} else {
+		q.Set("media", "ebook")
+	}
 	q.Set("limit", "20") // small batch — we only act on one per tick anyway
 	u := strings.TrimRight(m.townsquare, "/") + "/api/branches/mirror-candidates?" + q.Encode()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
@@ -304,10 +327,10 @@ func (m *Manager) processCandidate(ctx context.Context, c Candidate, bandwidth i
 	//    after download — so use the audiobook cap as the upper bound
 	//    and let per-kind logic re-check after sniffing.
 	if c.SizeBytes <= 0 {
-		return fmt.Errorf("reject %s: zero size advertised", c.BookID)
+		return permrejectf("reject %s: zero size advertised", c.BookID)
 	}
 	if c.SizeBytes > MaxAudiobookBytes {
-		return fmt.Errorf("reject %s: advertised size %d exceeds caps", c.BookID, c.SizeBytes)
+		return permrejectf("reject %s: advertised size %d exceeds caps", c.BookID, c.SizeBytes)
 	}
 
 	// 1a. Per-source quota: no single source may occupy more than
@@ -371,7 +394,7 @@ func (m *Manager) processCandidate(ctx context.Context, c Candidate, bandwidth i
 	//    what Town Square advertised. This catches in-flight tampering
 	//    AND a source that lied about its own hash via the sync API.
 	if !strings.EqualFold(result.SHA256, c.ContentSHA256) {
-		return fmt.Errorf("reject %s: hash mismatch (got=%s announced=%s)", c.BookID, result.SHA256, c.ContentSHA256)
+		return permrejectf("reject %s: hash mismatch (got=%s announced=%s)", c.BookID, result.SHA256, c.ContentSHA256)
 	}
 
 	// 5. Sniff magic bytes to identify the format. This is the ONLY
@@ -382,7 +405,7 @@ func (m *Manager) processCandidate(ctx context.Context, c Candidate, bandwidth i
 		return fmt.Errorf("sniff %s: %w", c.BookID, err)
 	}
 	if kind == KindUnknown {
-		return fmt.Errorf("reject %s: unknown file kind (no magic-byte match)", c.BookID)
+		return permrejectf("reject %s: unknown file kind (no magic-byte match)", c.BookID)
 	}
 
 	// 6. Per-kind size cap enforcement. The download cap above was
@@ -390,14 +413,14 @@ func (m *Manager) processCandidate(ctx context.Context, c Candidate, bandwidth i
 	//    the actual sniffed format.
 	maxBytes := perKindCap(kind)
 	if result.Size > maxBytes {
-		return fmt.Errorf("reject %s: %s size %d > cap %d", c.BookID, kind, result.Size, maxBytes)
+		return permrejectf("reject %s: %s size %d > cap %d", c.BookID, kind, result.Size, maxBytes)
 	}
 
 	// 7. Per-format structural validation. Catches zip bombs,
 	//    path-traversal entries, malformed XML, etc. before we ever
 	//    expose the bytes to the scanner or downstream readers.
 	if err := Validate(stagingPath, kind, maxBytes); err != nil {
-		return fmt.Errorf("reject %s: %w", c.BookID, err)
+		return permrejectf("reject %s: %v", c.BookID, err)
 	}
 
 	// 8. Pick the destination root by sniffed format, not by source
@@ -406,7 +429,10 @@ func (m *Manager) processCandidate(ctx context.Context, c Candidate, bandwidth i
 	dstRoot := m.libraryRoot
 	if kind == KindM4B {
 		if m.audiobookRoot == "" {
-			return fmt.Errorf("reject %s: no audiobook dir configured", c.BookID)
+			// We only request audiobooks when a dir is configured, so this
+			// is a mislabeled source (an M4B served for an ebook-only ask).
+			// Permanent: the same bytes will sniff M4B every time.
+			return permrejectf("reject %s: audiobook with no audiobook dir configured", c.BookID)
 		}
 		dstRoot = m.audiobookRoot
 	}

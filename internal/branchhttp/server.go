@@ -568,6 +568,13 @@ type BookMeta struct {
 	// to their library). Town Square uses this to prefer originals during
 	// download routing.
 	IsMirror bool `json:"is_mirror,omitempty"`
+
+	// Folder is the file's directory relative to its library/audiobook
+	// root, forward-slashed ("" = root, "Fiction/Sci-Fi" = nested). Town
+	// Square surfaces it as folder navigation when the branch is browsed
+	// via OPDS. Empty for mirror copies (they live under _mirror/ and
+	// aren't part of the owner's structure).
+	Folder string `json:"folder,omitempty"`
 }
 
 func isAllDigits(s string) bool {
@@ -618,6 +625,12 @@ func (s *Server) processScanFile(p string) scanFileResult {
 	if info, err := os.Stat(p); err == nil {
 		fsize, fmtime = info.Size(), info.ModTime()
 		if r, ok := s.scans.Get(p, fsize, fmtime); ok {
+			// Folder is derived from the path, not the file contents, so
+			// recompute it on every cache hit: this populates folders for
+			// libraries cached before the field existed, and reflects a
+			// move (mv preserves mtime, so the cache wouldn't otherwise miss)
+			// without re-parsing the book.
+			r.book.Folder = s.relFolder(p, r.isAudiobook)
 			return r
 		}
 	}
@@ -750,6 +763,7 @@ func (s *Server) processScanFile(p string) scanFileResult {
 			ContentSHA256:   sha,
 			SizeBytes:       size,
 			IsMirror:        mirror.IsMirrorPath(p),
+			Folder:          s.relFolder(p, isAudiobook),
 		},
 	}
 	if fmtime.IsZero() {
@@ -763,6 +777,32 @@ func (s *Server) processScanFile(p string) scanFileResult {
 		s.scans.Put(p, fsize, fmtime, res)
 	}
 	return res
+}
+
+// relFolder returns p's directory relative to its library/audiobook root,
+// forward-slashed, for OPDS folder navigation. "" means the root (or the
+// path can't be made relative). Mirror copies get "" — they live under
+// _mirror/ and aren't part of the owner's own structure.
+func (s *Server) relFolder(p string, isAudiobook bool) string {
+	if mirror.IsMirrorPath(p) {
+		return ""
+	}
+	root := s.libraryDir
+	if isAudiobook && s.cfg != nil && s.cfg.AudiobookPath != "" {
+		root = s.cfg.AudiobookPath
+	}
+	if root == "" {
+		return ""
+	}
+	rel, err := filepath.Rel(root, p)
+	if err != nil {
+		return ""
+	}
+	dir := filepath.ToSlash(filepath.Dir(rel))
+	if dir == "." || dir == "/" || strings.HasPrefix(dir, "..") {
+		return ""
+	}
+	return strings.Trim(dir, "/")
 }
 
 // scanWorkers bounds how many files UpdateCatalog processes concurrently.
@@ -915,6 +955,14 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/favicon.ico", s.handleFavicon)
 	s.mux.HandleFunc("/covers/", s.tunnelAuth(s.handleLocalCover))
 	s.mux.HandleFunc("/download/", s.handleDownload)
+	// Self-contained OPDS: point a catalog app at {name}.branch.pub/opds to
+	// browse and download only this branch. Same tunnelAuth as the dashboard
+	// (owner exempt on the local network); opensearch stays open.
+	s.mux.HandleFunc("/opds", s.tunnelAuth(s.handleOPDS))
+	s.mux.HandleFunc("/opds/", s.tunnelAuth(s.handleOPDS))
+	s.mux.HandleFunc("/opds/search", s.tunnelAuth(s.handleOPDSSearch))
+	s.mux.HandleFunc("/opds/opensearch.xml", s.handleOpenSearch)
+	s.mux.HandleFunc("/opds/download/", s.tunnelAuth(s.handleOPDSDownload))
 }
 
 // needsSetup returns true if the library path is not configured or invalid.
@@ -1141,9 +1189,11 @@ function selectFolder(field, path) {
   sel.innerHTML = '<span>' + escapeHTML(path) + '</span><button type="button" class="change-btn" onclick="changeFolder(\'' + field + '\')">Change</button>' + clearBtn;
 }
 function changeFolder(field) {
+  // Keep the current value in the hidden input while browsing: only an
+  // actual "Select This Folder" (or Clear) replaces it, so reloading or
+  // saving mid-browse can't wipe a configured folder.
   document.getElementById(field + '-picker').style.display = '';
   document.getElementById(field + '-selected').style.display = 'none';
-  document.getElementById(field).value = '';
   loadDir(field, '');
 }
 function clearFolder(field) {
@@ -1213,7 +1263,7 @@ func (s *Server) serveDashboard(w http.ResponseWriter, r *http.Request) {
 	// this dashboard through the tunnel must not see it.
 	var cardHTML string
 	if r.Header.Get("X-Mayberry-Via-Tunnel") == "" && s.cfg != nil && s.cfg.UserID != "" {
-		cardHTML = libraryCardHTML(s.cfg.UserID)
+		cardHTML = libraryCardHTML(s.cfg.UserID, subdomain)
 	}
 
 	var warningsHTML string
@@ -1552,8 +1602,9 @@ pollScanStatus();
 // libraryCardHTML renders the owner's library card panel on the local
 // dashboard: the ID itself plus how to use it. Never rendered for
 // tunnel visitors — the ID is the owner's sign-in credential.
-func libraryCardHTML(userID string) string {
+func libraryCardHTML(userID, subdomain string) string {
 	id := html.EscapeString(userID)
+	opdsURL := "https://" + html.EscapeString(subdomain) + "/opds"
 	return fmt.Sprintf(`<div class="section" style="margin-bottom:2rem">
     <div class="section-title">Your Library Card</div>
     <div style="background:hsl(var(--card));border:1px solid hsl(var(--border) / 0.06);border-radius:var(--radius);box-shadow:var(--shadow-sm);padding:1.25rem 1.4rem">
@@ -1562,12 +1613,13 @@ func libraryCardHTML(userID string) string {
         <button type="button" onclick="navigator.clipboard.writeText('%s').then(()=>{this.textContent='Copied ✓';setTimeout(()=>this.textContent='Copy',1500)})" style="background:transparent;border:1px solid hsl(var(--border) / 0.15);border-radius:calc(var(--radius) - 2px);padding:0.3rem 0.7rem;font-size:0.72rem;cursor:pointer;color:hsl(var(--muted-foreground));text-transform:uppercase;letter-spacing:0.05em;font-family:var(--font-sans)">Copy</button>
       </div>
       <ul style="margin:0;padding-left:1.1rem;font-size:0.88rem;color:hsl(var(--foreground));line-height:1.7">
-        <li><strong>Read:</strong> point any OPDS reading app at <code style="font-family:var(--font-mono);font-size:0.82rem;background:hsl(var(--muted));padding:0.1rem 0.4rem;border-radius:4px">https://mayberry.pub</code> and sign in with this card number as <strong>both username and password</strong>.</li>
+        <li><strong>Read everything you can see:</strong> point any OPDS reading app at <code style="font-family:var(--font-mono);font-size:0.82rem;background:hsl(var(--muted));padding:0.1rem 0.4rem;border-radius:4px">https://mayberry.pub</code> and sign in with this card number as <strong>both username and password</strong>.</li>
+        <li><strong>Read just this branch:</strong> point an OPDS app at <code style="font-family:var(--font-mono);font-size:0.82rem;background:hsl(var(--muted));padding:0.1rem 0.4rem;border-radius:4px">%s</code> to browse only your own library, same card as username &amp; password.</li>
         <li><strong>Share with friends:</strong> trade card numbers — sharing is mutual, so when either of you adds the other under People with Access, you both see each other's libraries.</li>
         <li><strong>Add friends or create guest cards</strong> in <a href="/settings" style="color:hsl(var(--primary))">Settings &rarr; Sharing</a>.</li>
       </ul>
     </div>
-  </div>`, id, id)
+  </div>`, id, id, opdsURL)
 }
 
 // --- Setup API ---
@@ -1580,8 +1632,11 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 
 	var req struct {
 		LibraryPath   string `json:"library_path"`
-		AudiobookPath string `json:"audiobook_path"`
-		DisplayName   string `json:"display_name"`
+		// Pointer: nil (field omitted) keeps the saved path, "" is an
+		// explicit clear. Guards the configured folder against clients
+		// that save the form without this field.
+		AudiobookPath *string `json:"audiobook_path"`
+		DisplayName   string  `json:"display_name"`
 
 		// Sharing allowlist — only applied when present in the request.
 		SharedUsers *[]string `json:"shared_users,omitempty"`
@@ -1603,7 +1658,9 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 	}
 
 	req.LibraryPath = strings.TrimSpace(req.LibraryPath)
-	req.AudiobookPath = strings.TrimSpace(req.AudiobookPath)
+	if req.AudiobookPath != nil {
+		*req.AudiobookPath = strings.TrimSpace(*req.AudiobookPath)
+	}
 	if req.LibraryPath == "" {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(400)
@@ -1645,8 +1702,8 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Audiobook path is optional; validate only if provided.
-	if req.AudiobookPath != "" {
-		ai, err := os.Stat(req.AudiobookPath)
+	if req.AudiobookPath != nil && *req.AudiobookPath != "" {
+		ai, err := os.Stat(*req.AudiobookPath)
 		if err != nil || !ai.IsDir() {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(400)
@@ -1660,7 +1717,9 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 		s.cfg = &config.BranchConfig{Port: 1950, ServerURL: config.DefaultServerURL}
 	}
 	s.cfg.LibraryPath = req.LibraryPath
-	s.cfg.AudiobookPath = req.AudiobookPath
+	if req.AudiobookPath != nil {
+		s.cfg.AudiobookPath = *req.AudiobookPath
+	}
 	s.libraryDir = req.LibraryPath
 
 	if req.DisplayName != "" {
@@ -2026,11 +2085,17 @@ function selectFolder(field, path) {
   sel.style.display = 'flex';
   var clearBtn = field === 'audiobook_path' ? '<button type="button" class="change-btn" style="margin-left:0.4rem;" onclick="clearFolder(\'' + field + '\')">Clear</button>' : '';
   sel.innerHTML = '<span>' + escapeHTML(path) + '</span><button type="button" class="change-btn" onclick="changeFolder(\'' + field + '\')">Change</button>' + clearBtn;
+  var alert = document.getElementById('alert');
+  alert.className = 'alert alert-success';
+  alert.textContent = 'Folder selected — click Save Settings to apply.';
+  alert.style.display = 'block';
 }
 function changeFolder(field) {
+  // Keep the current value in the hidden input while browsing: only an
+  // actual "Select This Folder" (or Clear) replaces it, so reloading or
+  // saving mid-browse can't wipe a configured folder.
   document.getElementById(field + '-picker').style.display = '';
   document.getElementById(field + '-selected').style.display = 'none';
-  document.getElementById(field).value = '';
   loadDir(field, '');
 }
 function clearFolder(field) {
