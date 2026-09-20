@@ -31,6 +31,15 @@ const opdsPageSize = 50
 // the book list. Folder for each book is derived from its path (relFolder),
 // so no extra stored state is needed.
 func (s *Server) handleOPDS(w http.ResponseWriter, r *http.Request) {
+	// Compat shim: OpenSearch-era readers that can't expand the OPDS 2.0
+	// search template (/opds/search{?query}) fetch the link target
+	// literally — it lands here via the /opds/ prefix route — expecting an
+	// OpenSearch description document. Serve the description so their
+	// search still works.
+	if strings.HasPrefix(r.URL.Path, "/opds/search{") {
+		s.handleOpenSearch(w, r)
+		return
+	}
 	folder := cleanBranchFolder(r.URL.Query().Get("folder"))
 	page := opdsParsePage(r)
 

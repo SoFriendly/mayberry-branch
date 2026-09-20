@@ -236,3 +236,23 @@ func TestBranchOPDSV2(t *testing.T) {
 		}
 	}
 }
+
+// TestBranchLiteralSearchTemplateServesOSDD mirrors the Town Square compat
+// shim: a literal fetch of the 2.0 search template lands on the /opds/
+// prefix route and must get the OpenSearch description, not a feed.
+func TestBranchLiteralSearchTemplateServesOSDD(t *testing.T) {
+	s := NewServer("branch-1", t.TempDir())
+	s.SetConfig(&config.BranchConfig{DisplayName: "Merry Vale", UserID: "123456789"})
+	r := httptest.NewRequest("GET", "/opds/search%7B?query%7D", nil)
+	w := httptest.NewRecorder()
+	s.ServeHTTP(w, r)
+	if w.Code != 200 {
+		t.Fatalf("got HTTP %d, want 200", w.Code)
+	}
+	if ct := w.Header().Get("Content-Type"); ct != "application/opensearchdescription+xml" {
+		t.Fatalf("content type %q", ct)
+	}
+	if !strings.Contains(w.Body.String(), "{searchTerms}") {
+		t.Fatal("OSDD missing searchTerms template")
+	}
+}
