@@ -1,6 +1,7 @@
 package branchhttp
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/sha256"
@@ -2665,7 +2666,6 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s%s"`, isbn, ext))
-	w.Header().Set("Content-Length", fmt.Sprintf("%d", finfo.Size()))
 
 	if isMirror {
 		// Fire the touch callback BEFORE the slow throttled write begins,
@@ -2676,17 +2676,29 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 				s.onMirrorServe(sha)
 			}
 		}
-		// Throttle mirror serves so we don't saturate the link the user
-		// is reading on. The configured rate is parsed every request so a
-		// settings change takes effect immediately without restart.
-		rate := serveRate(s.cfg)
-		if _, err := throttledCopy(r.Context(), w, f, rate); err != nil {
-			// Connection drops mid-mirror are routine — log quietly.
-			log.Printf("branch: mirror serve aborted (%s): %v", isbn, err)
-		}
-		return
+		// Throttle mirror replication so we don't saturate the link the
+		// user is reading on. Real reader downloads are never throttled.
+		// The configured rate is parsed every request so a settings change
+		// takes effect immediately without restart.
+		w = &throttledResponseWriter{ResponseWriter: w, ctx: r.Context(), rate: serveRate(s.cfg)}
 	}
-	io.Copy(w, f)
+	// ServeContent handles Range requests, so an interrupted download can
+	// resume where it left off instead of restarting from byte zero.
+	http.ServeContent(w, r, isbn+ext, finfo.ModTime(), f)
+}
+
+// throttledResponseWriter applies the mirror-serve rate cap to every body
+// write, so http.ServeContent can serve replication fetches (with Range
+// support) without losing the polite-neighbor throttle.
+type throttledResponseWriter struct {
+	http.ResponseWriter
+	ctx  context.Context
+	rate int64
+}
+
+func (t *throttledResponseWriter) Write(p []byte) (int, error) {
+	n, err := throttledCopy(t.ctx, t.ResponseWriter, bytes.NewReader(p), t.rate)
+	return int(n), err
 }
 
 // shaFromMirrorPath extracts the SHA-256 hash from a mirror file path.

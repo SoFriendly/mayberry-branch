@@ -43,6 +43,20 @@ func TestDownloadBranchBinding(t *testing.T) {
 			}
 		})
 	}
+	t.Run("range resume", func(t *testing.T) {
+		token, err := auth.IssueDownloadToken(keys, "owner", isbn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		r := httptest.NewRequest("GET", "/download/"+isbn+"?token="+token, nil)
+		r.Header.Set("Range", "bytes=5-")
+		w := httptest.NewRecorder()
+		s.handleDownload(w, r)
+		if w.Code != 206 || w.Body.String() != "contents" {
+			t.Fatalf("got %d %q, want 206 partial content", w.Code, w.Body.String())
+		}
+	})
+
 	s.SetBranchID("recovered")
 	token, _ := auth.IssueDownloadToken(keys, "recovered", isbn)
 	r := httptest.NewRequest("GET", "/download/"+isbn+"?token="+token, nil)
