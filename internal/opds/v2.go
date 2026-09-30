@@ -2,7 +2,9 @@ package opds
 
 import (
 	"encoding/json"
+	"html"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -17,6 +19,11 @@ import (
 // OpenSearch's {searchTerms} used by the 1.2 Atom feeds — handlers accept
 // both parameter names.
 const SearchTemplate = "/opds/search{?query}"
+
+// PublicationType is the media type of a standalone OPDS 2.0 publication
+// document. Clients match it byte-for-byte (no charset or profile
+// parameters), so it must be served exactly as written.
+const PublicationType = "application/opds-publication+json"
 
 // WantsV2 returns true if the client prefers OPDS 2.0 JSON over OPDS 1.2
 // Atom XML, honoring q-values per RFC 7231 §5.3.2. A tie (or no explicit
@@ -169,6 +176,7 @@ type v2PubMetadata struct {
 	Identifier  string   `json:"identifier,omitempty"`
 	Title       string   `json:"title"`
 	Author      string   `json:"author,omitempty"`
+	Publisher   string   `json:"publisher,omitempty"`
 	Narrator    string   `json:"narrator,omitempty"`
 	Subject     []string `json:"subject,omitempty"`
 	Language    string   `json:"language,omitempty"`
@@ -325,14 +333,17 @@ func entryToPublication(e Entry) v2Publication {
 
 	pub := v2Publication{
 		Metadata: v2PubMetadata{
-			Type:        schemaType,
-			Identifier:  identifier,
-			Title:       e.Title,
-			Author:      e.Author,
-			Narrator:    e.Narrator,
-			Subject:     e.Categories,
-			Language:    e.Language,
-			Description: e.Summary,
+			Type:       schemaType,
+			Identifier: identifier,
+			Title:      e.Title,
+			Author:     e.Author,
+			Publisher:  e.Publisher,
+			Narrator:   e.Narrator,
+			Subject:    e.Categories,
+			Language:   e.Language,
+			// Clients don't strip HTML on the JSON path (only Atom), so the
+			// description must be plain text here.
+			Description: plainText(e.Summary),
 			Duration:    e.DurationSeconds,
 		},
 	}
@@ -346,6 +357,13 @@ func entryToPublication(e Entry) v2Publication {
 			Type: acqType,
 		})
 	}
+	if id := PublicationHref(e); id != "" {
+		pub.Links = append(pub.Links, v2Link{
+			Rel:  "self",
+			Href: id,
+			Type: PublicationType,
+		})
+	}
 	if e.CoverHref != "" {
 		// Type omitted when unknown (valid per RWPM); clients sniff.
 		pub.Images = append(pub.Images, v2Link{
@@ -354,6 +372,52 @@ func entryToPublication(e Entry) v2Publication {
 		})
 	}
 	return pub
+}
+
+// PublicationHref returns the standalone publication-document URL for an
+// entry, or "" when the entry carries no book ID. Branch entries set ID;
+// Town Square entries carry the book ID in ISBN (ID is left empty there so
+// Atom entry IDs keep their urn:isbn: form).
+func PublicationHref(e Entry) string {
+	id := e.ID
+	if id == "" {
+		id = e.ISBN
+	}
+	if id == "" {
+		return ""
+	}
+	return "/opds/publications/" + url.PathEscape(id)
+}
+
+// PublicationV2 emits a standalone OPDS 2.0 publication document for one
+// entry — the detail page a client fetches via the publication's self link.
+// Serve it with Content-Type PublicationType.
+func PublicationV2(e Entry) ([]byte, error) {
+	return json.MarshalIndent(entryToPublication(e), "", "  ")
+}
+
+// plainText strips HTML tags from s and unescapes entities, collapsing the
+// result to plain text suitable for JSON description fields.
+func plainText(s string) string {
+	if !strings.ContainsAny(s, "<&") {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	inTag := false
+	for _, r := range s {
+		switch {
+		case inTag:
+			if r == '>' {
+				inTag = false
+			}
+		case r == '<':
+			inTag = true
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return strings.TrimSpace(html.UnescapeString(b.String()))
 }
 
 // NavigationOnlyV2 emits a feed of nav items (used when entries are subsections, not publications).

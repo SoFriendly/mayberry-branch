@@ -360,6 +360,39 @@ func (s *Server) handleOPDSDownload(w http.ResponseWriter, r *http.Request) {
 	http.ServeContent(w, r, id+ext, info.ModTime(), f)
 }
 
+// handleOPDSPublication serves the standalone OPDS 2.0 publication document
+// each v2 feed publication links to with rel=self. Metadata is what the
+// branch has locally (title/author/cover) — richer fields live in the
+// mayberry.pub document. Auth is the same tunnelAuth session as the feeds.
+func (s *Server) handleOPDSPublication(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/opds/publications/"), "/")
+	if id == "" || strings.Contains(id, "/") {
+		http.NotFound(w, r)
+		return
+	}
+	s.mu.RLock()
+	var entry *CatalogEntry
+	for i := range s.catalog {
+		if s.catalog[i].ID == id {
+			e := s.catalog[i]
+			entry = &e
+			break
+		}
+	}
+	s.mu.RUnlock()
+	if entry == nil {
+		http.NotFound(w, r)
+		return
+	}
+	data, err := opds.PublicationV2(catalogEntryToOPDS(*entry))
+	if err != nil {
+		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", opds.PublicationType)
+	w.Write(data)
+}
+
 // urlQueryEscape percent-escapes a query value for embedding in a feed link.
 func urlQueryEscape(s string) string {
 	var b strings.Builder

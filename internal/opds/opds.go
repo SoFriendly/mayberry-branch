@@ -32,6 +32,7 @@ type Entry struct {
 	Language        string
 	Narrator        string
 	DurationSeconds int
+	Publisher       string
 }
 
 // Feed generates an OPDS 1.2 Atom XML feed.

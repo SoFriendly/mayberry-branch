@@ -964,6 +964,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/opds/search", s.tunnelAuth(s.handleOPDSSearch))
 	s.mux.HandleFunc("/opds/opensearch.xml", s.handleOpenSearch)
 	s.mux.HandleFunc("/opds/download/", s.tunnelAuth(s.handleOPDSDownload))
+	s.mux.HandleFunc("/opds/publications/", s.tunnelAuth(s.handleOPDSPublication))
 }
 
 // needsSetup returns true if the library path is not configured or invalid.
