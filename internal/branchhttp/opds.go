@@ -118,7 +118,7 @@ func (s *Server) handleOPDS(w http.ResponseWriter, r *http.Request) {
 	for _, e := range books[start:end] {
 		entries = append(entries, catalogEntryToOPDS(e))
 	}
-	s.writeOPDS(w, r, basePath, feedID, title, entries, page, hasNext)
+	s.writeOPDS(w, r, basePath, feedID, title, entries, page, hasNext, len(books))
 }
 
 // cleanBranchFolder normalizes a ?folder= value: forward-slashed, no
@@ -174,9 +174,9 @@ func (s *Server) handleOPDSSearch(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Missing search query", http.StatusBadRequest)
 		return
 	}
-	entries, page, hasNext, title := s.opdsPage(r, q)
+	entries, page, hasNext, total, title := s.opdsPage(r, q)
 	base := "/opds/search?q=" + urlQueryEscape(q)
-	s.writeOPDS(w, r, base, "urn:mayberry:branch:opds:search", "Search: "+title, entries, page, hasNext)
+	s.writeOPDS(w, r, base, "urn:mayberry:branch:opds:search", "Search: "+title, entries, page, hasNext, total)
 }
 
 // handleOpenSearch advertises the branch's search endpoint.
@@ -188,7 +188,7 @@ func (s *Server) handleOpenSearch(w http.ResponseWriter, r *http.Request) {
 // opdsPage snapshots the catalog (optionally filtered by query), sorts it by
 // title, and returns the requested page of OPDS entries plus whether another
 // page follows and the branch's display name.
-func (s *Server) opdsPage(r *http.Request, query string) (entries []opds.Entry, page int, hasNext bool, branchName string) {
+func (s *Server) opdsPage(r *http.Request, query string) (entries []opds.Entry, page int, hasNext bool, total int, branchName string) {
 	page = 0
 	if p := r.URL.Query().Get("page"); p != "" {
 		fmt.Sscanf(p, "%d", &page)
@@ -233,7 +233,7 @@ func (s *Server) opdsPage(r *http.Request, query string) (entries []opds.Entry, 
 	for _, e := range cat[start:end] {
 		entries = append(entries, catalogEntryToOPDS(e))
 	}
-	return entries, page, hasNext, branchName
+	return entries, page, hasNext, len(cat), branchName
 }
 
 // catalogEntryToOPDS maps a local catalog row to an OPDS entry with links
@@ -263,7 +263,7 @@ func catalogEntryToOPDS(e CatalogEntry) opds.Entry {
 // writeOPDS negotiates OPDS 1.2 Atom vs 2.0 JSON (same rules as Town
 // Square: 2.0 only on an explicit Accept preference) and renders an
 // acquisition feed with first/previous/next paging.
-func (s *Server) writeOPDS(w http.ResponseWriter, r *http.Request, basePath, id, title string, entries []opds.Entry, page int, hasNext bool) {
+func (s *Server) writeOPDS(w http.ResponseWriter, r *http.Request, basePath, id, title string, entries []opds.Entry, page int, hasNext bool, total int) {
 	var nav []opds.NavLink
 	if page > 0 {
 		nav = append(nav,
@@ -281,6 +281,7 @@ func (s *Server) writeOPDS(w http.ResponseWriter, r *http.Request, basePath, id,
 			SearchHref: opds.SearchTemplate,
 			Page:       page + 1,
 			PageSize:   opdsPageSize,
+			Total:      total,
 			Entries:    entries,
 			Nav:        nav,
 		})
