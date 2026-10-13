@@ -44,10 +44,10 @@ const server = http.createServer(async (req, res) => {
       assert.equal(await page.locator('#branches input').count(),1);
       // Confirm this fixture reproduces the original relative-fetch failure.
       if (embedded) assert.equal(await page.evaluate(async () => {try {await fetch('/api/feed-preferences');return false;} catch (e) {return e instanceof TypeError;}}),true);
-      await page.locator('#mirrors').check();
+      await page.locator('#size').fill('5');
       await page.locator('#save').click();
       await page.waitForFunction(() => document.getElementById('status').textContent.startsWith('Saved'));
-      assert.equal(preferences.exclude_mirrored,true);
+      assert.equal(preferences.max_size_bytes,5000000);
       await page.locator('#shared-users').fill('987654321, 333333333');
       await page.locator('#sharing-form button[type=submit]').click();
       await page.waitForFunction(() => document.getElementById('sharing-status').textContent.startsWith('Sharing saved'));

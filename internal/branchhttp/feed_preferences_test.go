@@ -23,18 +23,18 @@ func TestCatalogPreferencesProxyAndTunnelIsolation(t *testing.T) {
 		}
 		if r.Method == http.MethodPut {
 			b, _ := io.ReadAll(r.Body)
-			if string(b) != `{"exclude_mirrored":true}` {
+			if string(b) != `{"max_size_bytes":5}` {
 				t.Error("preferences changed in proxy")
 			}
 		}
 		w.Header().Set("Content-Type", "application/json")
-		io.WriteString(w, `{"preferences":{"exclude_mirrored":true},"branches":[]}`)
+		io.WriteString(w, `{"preferences":{"max_size_bytes":5},"branches":[]}`)
 	}))
 	defer upstream.Close()
 	s := NewServer("branch", t.TempDir())
 	s.SetConfig(&config.BranchConfig{UserID: "123456789", ServerURL: upstream.URL})
 	for _, method := range []string{http.MethodGet, http.MethodPut} {
-		r := httptest.NewRequest(method, "/api/feed-preferences", strings.NewReader(`{"exclude_mirrored":true}`))
+		r := httptest.NewRequest(method, "/api/feed-preferences", strings.NewReader(`{"max_size_bytes":5}`))
 		r.Header.Set("Content-Type", "application/json")
 		w := httptest.NewRecorder()
 		s.ServeHTTP(w, r)

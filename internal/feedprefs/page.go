@@ -12,7 +12,6 @@ func Page(endpoint string) string {
 <p>Choose what appears in your catalog, search results, and downloads. These preferences apply everywhere you use this library card. They do not change your library or anyone else's catalog.</p>
 <form id="filters"><fieldset id="fields" disabled>
 <div id="branch-heading" class="branch-heading">Branches</div><small id="branch-help">Check the branches you want to see in your catalog. Uncheck a branch to hide its books.</small><div id="branches" role="group" aria-labelledby="branch-heading" aria-describedby="branch-help"></div>
-<label class="check"><input id="mirrors" type="checkbox">Exclude mirrored copies</label><small>A book can still appear if an original copy meets your filters.</small>
 <label for="size">Maximum file size (MB)</label><small>Leave blank for no limit. A book can appear if at least one eligible copy fits.</small><input id="size" type="number" min="0" step="any" placeholder="No limit">
 <label class="check"><input id="unknown-size" type="checkbox" checked>Include files with unknown size when a limit is set</label>
 <label for="languages">Languages</label><small>Comma-separated codes, such as en, fr, de, es, ja. Leave blank for all languages. Regional variants match their main language.</small><input id="languages" type="text" placeholder="All languages" autocomplete="off">
@@ -32,7 +31,7 @@ function settingsFetch(path,options={}){
  if(page.username||page.password)headers.set('Authorization','Basic '+btoa(decodeURIComponent(page.username)+':'+decodeURIComponent(page.password)));
  return fetch(target.href,{...options,headers,credentials:'same-origin'});
 }
-const defaults={include_branches:[],exclude_branches:[],exclude_mirrored:false,max_size_bytes:0,languages:[],include_unknown_size:true,include_unknown_language:true};
+const defaults={include_branches:[],exclude_branches:[],max_size_bytes:0,languages:[],include_unknown_size:true,include_unknown_language:true};
 let branches=[],savedIncludes=[];
 function show(p){
  savedIncludes=[...(p.include_branches||[])];
@@ -45,12 +44,12 @@ function show(p){
   label.append(checkbox,document.createTextNode(b.name+' ('+b.subdomain+')'+(b.online?'':' — offline')));el('branches').append(label);
  }
  if(!options.length)el('branches').textContent='No shared branches yet.';
- el('mirrors').checked=p.exclude_mirrored;el('size').value=p.max_size_bytes?p.max_size_bytes/1000000:'';el('languages').value=(p.languages||[]).join(', ');el('unknown-size').checked=p.include_unknown_size;el('unknown-language').checked=p.include_unknown_language;
+ el('size').value=p.max_size_bytes?p.max_size_bytes/1000000:'';el('languages').value=(p.languages||[]).join(', ');el('unknown-size').checked=p.include_unknown_size;el('unknown-language').checked=p.include_unknown_language;
 }
 async function load(){try{const r=await settingsFetch(endpoint,{cache:'no-store'});if(!r.ok)throw Error('Could not load settings. Check your library card and try again.');const d=await r.json();branches=d.branches;show(d.preferences);el('fields').disabled=false;el('status').textContent='';}catch(e){el('status').textContent=e.message}}
 el('reset').onclick=()=>{show(defaults);el('status').textContent='Filters reset. Save to apply.'};
 el('filters').onsubmit=async e=>{e.preventDefault();const choices=Array.from(el('branches').querySelectorAll('input')),checked=choices.filter(o=>o.checked).map(o=>o.value),unchecked=choices.filter(o=>!o.checked).map(o=>o.value);const size=el('size').value.trim()===''?0:Math.round(Number(el('size').value)*1000000);if(!Number.isSafeInteger(size)||size<0){el('status').textContent='Enter a valid file size.';return}
- const p={include_branches:savedIncludes.length?(checked.length?checked:savedIncludes):[],exclude_branches:unchecked,exclude_mirrored:el('mirrors').checked,max_size_bytes:size,languages:el('languages').value.split(',').map(x=>x.trim()).filter(Boolean),include_unknown_size:el('unknown-size').checked,include_unknown_language:el('unknown-language').checked};
+ const p={include_branches:savedIncludes.length?(checked.length?checked:savedIncludes):[],exclude_branches:unchecked,max_size_bytes:size,languages:el('languages').value.split(',').map(x=>x.trim()).filter(Boolean),include_unknown_size:el('unknown-size').checked,include_unknown_language:el('unknown-language').checked};
  el('fields').disabled=true;el('status').textContent='Saving…';try{const r=await settingsFetch(endpoint,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)});if(!r.ok)throw Error((await r.text()).trim()||'Could not save settings.');const d=await r.json();show(d.preferences);el('status').textContent='Saved. Refresh your reader’s catalog to see the changes.'}catch(e){el('status').textContent=e.message}finally{el('fields').disabled=false}};
 load();
 </script></body></html>`

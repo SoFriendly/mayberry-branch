@@ -11,7 +11,6 @@ import (
 type Preferences struct {
 	IncludeBranches        []string `json:"include_branches"`
 	ExcludeBranches        []string `json:"exclude_branches"`
-	ExcludeMirrored        bool     `json:"exclude_mirrored"`
 	MaxSizeBytes           int64    `json:"max_size_bytes"`
 	Languages              []string `json:"languages"`
 	IncludeUnknownSize     bool     `json:"include_unknown_size"`
