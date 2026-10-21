@@ -431,13 +431,38 @@ func startFullServices(ctx context.Context, cfg *config.BranchConfig, hubURL str
 			if pending == nil {
 				continue
 			}
-			if err := syncBooks(cfg.ServerURL, branchID, branchSrv.CoverDir(), pending, cfg.SharedUsers, cfg.BranchCredential); err != nil {
+			orphans, err := syncBooks(cfg.ServerURL, branchID, branchSrv.CoverDir(), pending, cfg.SharedUsers, cfg.BranchCredential)
+			if err != nil {
 				log.Printf("branch: sync: %v (retrying in 1m)", err)
 				alog.Add("Sync to Town Square failed — retrying in 1 minute")
 				retry = time.After(time.Minute)
 				continue
 			}
 			alog.Add(fmt.Sprintf("Synced %d title(s) to Town Square", len(pending)))
+			// Delete mirror files for books the catalog no longer knows —
+			// they can never be listed or downloaded again. Removal
+			// triggers a rescan (watch dir changed), which drops them
+			// from the next sync's payload.
+			if n := branchSrv.RemoveMirrorOrphans(orphans); n > 0 {
+				log.Printf("branch: removed %d orphaned mirror file(s)", n)
+				alog.Add(fmt.Sprintf("Removed %d orphaned mirror file(s) no longer in the catalog", n))
+			}
+			// Re-upload covers whose embedded image changed since Town
+			// Square first stored them. Marked entries survive a failed
+			// attempt and retry on the next sync.
+			if dirty := branchSrv.DirtyCovers(); len(dirty) > 0 {
+				refreshed := 0
+				for _, id := range dirty {
+					if uploadCover(cfg.ServerURL, branchID, branchSrv.CoverDir(), id, cfg.BranchCredential, true) {
+						branchSrv.ClearDirtyCover(id)
+						refreshed++
+					}
+				}
+				if refreshed > 0 {
+					log.Printf("branch: refreshed %d changed cover(s) on Town Square", refreshed)
+					alog.Add(fmt.Sprintf("Refreshed %d changed cover(s) on Town Square", refreshed))
+				}
+			}
 			pending = nil
 		}
 	}()
@@ -549,6 +574,7 @@ func startFullServices(ctx context.Context, cfg *config.BranchConfig, hubURL str
 		branchSrv.SetMirrorServeCallback(mgr.OnServe)
 		branchSrv.SetMirrorStatsFn(mgr.Stats)
 		branchSrv.SetMirrorPurgeFn(mgr.Purge)
+		branchSrv.SetMirrorOrphanFn(mgr.RemoveOrphans)
 		mgr.Start(ctx)
 	}
 
@@ -672,12 +698,14 @@ func fetchTunnelToken(serverURL, branchID, subdomain, credential string) (string
 // holdings race) happened.
 var syncClient = &http.Client{Timeout: 2 * time.Minute}
 
-// syncBooks pushes the full catalog to Town Square. A non-nil return
+// syncBooks pushes the full catalog to Town Square. A non-nil error
 // means the catalog may not have landed and the caller should retry.
+// Returns the book IDs the server reported as orphaned mirror copies
+// (no longer in the catalog) so the caller can delete the dead files.
 // sharedUsers rides along on every sync so allowlist edits in settings
 // propagate within one scan interval; it must be non-nil (an empty list
 // marshals to [] — a JSON null would make Town Square skip the update).
-func syncBooks(serverURL, branchID, coverDir string, books []branchhttp.BookMeta, sharedUsers []string, credential string) error {
+func syncBooks(serverURL, branchID, coverDir string, books []branchhttp.BookMeta, sharedUsers []string, credential string) ([]string, error) {
 	if sharedUsers == nil {
 		sharedUsers = []string{}
 	}
@@ -687,42 +715,45 @@ func syncBooks(serverURL, branchID, coverDir string, books []branchhttp.BookMeta
 		"shared_user_ids": sharedUsers,
 	})
 	if err != nil {
-		return fmt.Errorf("marshal: %w", err)
+		return nil, fmt.Errorf("marshal: %w", err)
 	}
 	resp, err := auth.BranchPost(syncClient, serverURL+"/api/branches/sync", credential, bytes.NewReader(body))
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("server returned %s", resp.Status)
+		return nil, fmt.Errorf("server returned %s", resp.Status)
 	}
 
 	var result struct {
-		Status      string   `json:"status"`
-		NeedsCovers []string `json:"needs_covers"`
+		Status          string   `json:"status"`
+		NeedsCovers     []string `json:"needs_covers"`
+		OrphanedMirrors []string `json:"orphaned_mirrors"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil // sync landed; cover hints are best-effort
+		return nil, nil // sync landed; cover and orphan hints are best-effort
 	}
 	if coverDir == "" || len(result.NeedsCovers) == 0 {
-		return nil
+		return result.OrphanedMirrors, nil
 	}
 	uploaded := 0
 	for _, isbn := range result.NeedsCovers {
-		if uploadCover(serverURL, branchID, coverDir, isbn, credential) {
+		if uploadCover(serverURL, branchID, coverDir, isbn, credential, false) {
 			uploaded++
 		}
 	}
 	if uploaded > 0 {
 		log.Printf("branch: uploaded %d cover(s) to Town Square", uploaded)
 	}
-	return nil
+	return result.OrphanedMirrors, nil
 }
 
 // uploadCover sends a single cover image to Town Square. Returns true on
-// successful upload (or if no local file exists, which is silent).
-func uploadCover(serverURL, branchID, coverDir, isbn, credential string) bool {
+// successful upload (or if no local file exists, which is silent). refresh
+// asks the server to replace an existing cover — used when the local file's
+// embedded cover changed; otherwise the server keeps the first cover it saw.
+func uploadCover(serverURL, branchID, coverDir, isbn, credential string, refresh bool) bool {
 	ext := ".jpg"
 	path := filepath.Join(coverDir, isbn+ext)
 	data, err := os.ReadFile(path)
@@ -740,6 +771,7 @@ func uploadCover(serverURL, branchID, coverDir, isbn, credential string) bool {
 		"isbn":      isbn,
 		"cover_b64": base64.StdEncoding.EncodeToString(data),
 		"ext":       ext,
+		"refresh":   refresh,
 	})
 	if err != nil {
 		return false
@@ -1126,7 +1158,9 @@ func performAutoUpdate(alog *activityLog) bool {
 	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
 		return false
 	}
-	if info.Version == "" || info.Version == "unknown" || info.Version == Version {
+	// Strictly newer only — never sideways or back. A compromised server
+	// re-serving an older signed release can't roll clients back.
+	if !isNewerVersion(info.Version, Version) {
 		return false
 	}
 
@@ -1137,9 +1171,17 @@ func performAutoUpdate(alog *activityLog) bool {
 	if runtime.GOOS == "windows" {
 		ext = ".exe"
 	}
-	url := fmt.Sprintf("%s/releases/mayberry-%s-%s%s", config.DefaultServerURL, runtime.GOOS, runtime.GOARCH, ext)
+	name := fmt.Sprintf("mayberry-%s-%s%s", runtime.GOOS, runtime.GOARCH, ext)
+	url := config.DefaultServerURL + "/releases/" + name
 
 	dlClient := &http.Client{Timeout: 5 * time.Minute}
+	sig, err := fetchReleaseSignature(dlClient, url)
+	if err != nil {
+		// Fail closed: an unsigned release never installs.
+		log.Printf("auto-update: no release signature: %v", err)
+		alog.Add(fmt.Sprintf("Auto-update skipped: release %s has no valid signature", info.Version))
+		return false
+	}
 	dlResp, err := dlClient.Get(url)
 	if err != nil {
 		log.Printf("auto-update: download failed: %v", err)
@@ -1182,6 +1224,15 @@ func performAutoUpdate(alog *activityLog) bool {
 	}
 	tmp.Close()
 	os.Chmod(tmpPath, 0755)
+
+	// Verify BEFORE checkUpdateExecutable — that check executes the
+	// downloaded binary, which must never happen unverified.
+	if err := verifyReleaseSignature(tmpPath, name, info.Version, sig); err != nil {
+		os.Remove(tmpPath)
+		log.Printf("auto-update: %v — refusing to install", err)
+		alog.Add(fmt.Sprintf("Auto-update refused: release %s failed signature verification", info.Version))
+		return false
+	}
 
 	if err := checkUpdateExecutable(tmpPath, info.Version); err != nil {
 		os.Remove(tmpPath)
@@ -1392,7 +1443,7 @@ func handleUpdate() {
 		return
 	}
 
-	if info.Version == Version {
+	if !isNewerVersion(info.Version, Version) {
 		fmt.Printf("Already up to date (version %s).\n", Version)
 		return
 	}
@@ -1400,13 +1451,18 @@ func handleUpdate() {
 	fmt.Printf("Update available: %s -> %s\n", Version, info.Version)
 
 	// Download the new binary.
-	goos := runtime.GOOS
-	goarch := runtime.GOARCH
 	ext := ""
-	if goos == "windows" {
+	if runtime.GOOS == "windows" {
 		ext = ".exe"
 	}
-	url := fmt.Sprintf("%s/releases/mayberry-%s-%s%s", serverURL, goos, goarch, ext)
+	name := fmt.Sprintf("mayberry-%s-%s%s", runtime.GOOS, runtime.GOARCH, ext)
+	url := serverURL + "/releases/" + name
+
+	sig, err := fetchReleaseSignature(httpClient, url)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Release %s has no valid signature (%v) — refusing to install.\n", info.Version, err)
+		os.Exit(1)
+	}
 
 	fmt.Printf("Downloading from %s...\n", url)
 	dlResp, err := httpClient.Get(url)
@@ -1447,6 +1503,14 @@ func handleUpdate() {
 	}
 	tmp.Close()
 	os.Chmod(tmpPath, 0755)
+
+	// Verify BEFORE checkUpdateExecutable — that check executes the
+	// downloaded binary, which must never happen unverified.
+	if err := verifyReleaseSignature(tmpPath, name, info.Version, sig); err != nil {
+		os.Remove(tmpPath)
+		fmt.Fprintf(os.Stderr, "Release failed signature verification (%v) — refusing to install.\n", err)
+		os.Exit(1)
+	}
 
 	if err := checkUpdateExecutable(tmpPath, info.Version); err != nil {
 		os.Remove(tmpPath)

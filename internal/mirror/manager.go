@@ -511,6 +511,60 @@ func (m *Manager) Stats() Stats {
 	return s
 }
 
+// RemoveOrphans deletes mirrored files whose book IDs Town Square no longer
+// recognizes (reported in the sync response as orphaned_mirrors: the
+// original's owner replaced or removed the file, so the catalog row is gone
+// for good — mirror holdings never re-create rows). Nothing can list or
+// download these, and cap-based eviction never fires just to tidy, so
+// without this the dead bytes sit forever. Files served within the eviction
+// protection window are skipped (a cached-feed download may be in flight)
+// and retried on a later sync, since the server re-reports orphans every
+// time. Returns how many files were removed.
+func (m *Manager) RemoveOrphans(bookIDs []string) int {
+	if len(bookIDs) == 0 {
+		return 0
+	}
+	m.purgeMu.Lock()
+	defer m.purgeMu.Unlock()
+	orphan := make(map[string]bool, len(bookIDs))
+	for _, id := range bookIDs {
+		orphan[id] = true
+	}
+	removed := 0
+	now := time.Now().UTC()
+	roots := []struct {
+		idx  *Index
+		root string
+	}{{m.libIndex, m.libraryRoot}, {m.abIndex, m.audiobookRoot}}
+	for _, r := range roots {
+		if r.idx == nil || r.root == "" {
+			continue
+		}
+		changed := false
+		for sha, e := range r.idx.Snapshot() {
+			if !orphan[e.BookID] || now.Sub(e.LastServedAt) < EvictionProtectionWindow {
+				continue
+			}
+			if path, found := findFanoutFile(r.root, sha); found {
+				if err := os.Remove(path); err != nil {
+					log.Printf("mirror: remove orphan %s: %v", sha, err)
+					continue
+				}
+			}
+			r.idx.Remove(sha)
+			changed = true
+			removed++
+			log.Printf("mirror: removed orphaned %s (book=%s no longer in catalog)", sha, e.BookID)
+		}
+		if changed {
+			if err := r.idx.Save(); err != nil {
+				log.Printf("mirror: index save after orphan removal: %v", err)
+			}
+		}
+	}
+	return removed
+}
+
 // Purge wipes every mirrored file under both mirror roots and clears the
 // indexes. Blocks until any in-flight download completes (via purgeMu),
 // then runs atomically. Returns first error encountered but continues

@@ -391,6 +391,10 @@ type MirrorServeCallback func(sha string)
 // Returns nil-ish (zero-value Stats) when mirroring is disabled.
 type MirrorStatsFn func() mirror.Stats
 
+// MirrorOrphanFn deletes mirrored files for book IDs the catalog no longer
+// recognizes. Returns how many files were removed.
+type MirrorOrphanFn func(bookIDs []string) int
+
 // MirrorPurgeFn deletes all mirrored content. Blocks until in-flight
 // downloads complete.
 type MirrorPurgeFn func() error
@@ -423,15 +427,24 @@ type Server struct {
 	holdings     map[string]string // isbn -> filepath
 	scanWarnings []string          // walk errors from the most recent library scan
 
-	cfg           *config.BranchConfig
-	version       string // set by main, surfaced in /api/status for version-aware singleton checks
-	onSetup       SetupCallback
-	onRestart     RestartCallback
-	onShutdown    RestartCallback // same shape as restart, but no restart — used by takeover
-	onSync        SyncCallback
-	onMirrorServe MirrorServeCallback
-	onMirrorStats MirrorStatsFn
-	onMirrorPurge MirrorPurgeFn
+	// Books whose locally cached cover was replaced because the file
+	// changed; the sync loop re-uploads these to Town Square (which keeps
+	// the first cover it saw unless told to refresh). In-memory only: lost
+	// on restart, where the persisted scan cache means the change won't be
+	// re-detected either — an accepted gap for a best-effort refresh.
+	coverDirtyMu sync.Mutex
+	coverDirty   map[string]bool
+
+	cfg            *config.BranchConfig
+	version        string // set by main, surfaced in /api/status for version-aware singleton checks
+	onSetup        SetupCallback
+	onRestart      RestartCallback
+	onShutdown     RestartCallback // same shape as restart, but no restart — used by takeover
+	onSync         SyncCallback
+	onMirrorServe  MirrorServeCallback
+	onMirrorStats  MirrorStatsFn
+	onMirrorPurge  MirrorPurgeFn
+	onMirrorOrphan MirrorOrphanFn
 }
 
 // CatalogEntry is a scanned epub with its metadata and path.
@@ -528,6 +541,22 @@ func (s *Server) SetMirrorPurgeFn(fn MirrorPurgeFn) {
 	s.onMirrorPurge = fn
 }
 
+// SetMirrorOrphanFn registers the mirror manager's orphan removal, called
+// by the sync loop with the book IDs Town Square reported as no longer in
+// the catalog (orphaned_mirrors in the sync response).
+func (s *Server) SetMirrorOrphanFn(fn MirrorOrphanFn) {
+	s.onMirrorOrphan = fn
+}
+
+// RemoveMirrorOrphans deletes mirrored files for the given dead book IDs.
+// No-op (returns 0) when mirroring is disabled.
+func (s *Server) RemoveMirrorOrphans(ids []string) int {
+	if s.onMirrorOrphan == nil || len(ids) == 0 {
+		return 0
+	}
+	return s.onMirrorOrphan(ids)
+}
+
 // SetPublicKey sets the Town Square public key for JWT verification.
 // CoverDir returns the directory where extracted cover images are cached.
 func (s *Server) CoverDir() string {
@@ -612,6 +641,59 @@ type scanFileResult struct {
 	hasTitle    bool // gates holdings/books, same as the old `if title != ""`
 	entry       CatalogEntry
 	book        BookMeta
+}
+
+// writeFileAtomic writes via temp-file-then-rename so two files that map to
+// the same book ID (an original and its mirror copy) scanning concurrently
+// can't interleave writes into one torn cover.
+func writeFileAtomic(path string, data []byte) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".cover-*")
+	if err != nil {
+		return err
+	}
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		os.Remove(tmp.Name())
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmp.Name())
+		return err
+	}
+	os.Chmod(tmp.Name(), 0644)
+	if err := os.Rename(tmp.Name(), path); err != nil {
+		os.Remove(tmp.Name())
+		return err
+	}
+	return nil
+}
+
+func (s *Server) markCoverDirty(id string) {
+	s.coverDirtyMu.Lock()
+	defer s.coverDirtyMu.Unlock()
+	if s.coverDirty == nil {
+		s.coverDirty = make(map[string]bool)
+	}
+	s.coverDirty[id] = true
+}
+
+// DirtyCovers lists books whose cached cover changed since the last
+// successful re-upload. Entries stay marked until ClearDirtyCover, so a
+// failed upload retries on the next sync.
+func (s *Server) DirtyCovers() []string {
+	s.coverDirtyMu.Lock()
+	defer s.coverDirtyMu.Unlock()
+	ids := make([]string, 0, len(s.coverDirty))
+	for id := range s.coverDirty {
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+func (s *Server) ClearDirtyCover(id string) {
+	s.coverDirtyMu.Lock()
+	defer s.coverDirtyMu.Unlock()
+	delete(s.coverDirty, id)
 }
 
 // processScanFile does the full per-file scan: metadata extraction, cover
@@ -714,16 +796,28 @@ func (s *Server) processScanFile(p string) scanFileResult {
 			coverExt = ".png"
 		}
 		coverPath := filepath.Join(s.coverDir, id+coverExt)
-		// Only write covers that aren't cached yet. They're keyed by book
-		// ID and effectively immutable, and rewriting all of them on every
-		// scan meant each mirror download (which dirties the watch dir and
-		// triggers a full rescan) rewrote the entire cover cache — ~1GB of
-		// disk writes per downloaded book on a large library.
-		if _, statErr := os.Stat(coverPath); statErr == nil {
+		// This code only runs on a scan-cache miss, i.e. for a new or
+		// changed file, so writing the cover here is cheap (unchanged
+		// files never reach it — that invariant is what keeps a mirror
+		// download from rewriting the whole cover cache). A changed file
+		// whose embedded cover differs replaces the cached one and is
+		// marked dirty so the next sync re-uploads it to Town Square,
+		// which otherwise keeps the first cover it ever saw.
+		if old, readErr := os.ReadFile(coverPath); readErr == nil {
 			hasCover = true
-		} else if err := os.WriteFile(coverPath, coverData, 0644); err == nil {
+			if !bytes.Equal(old, coverData) && writeFileAtomic(coverPath, coverData) == nil {
+				s.markCoverDirty(id)
+			}
+		} else if writeFileAtomic(coverPath, coverData) == nil {
 			hasCover = true
 		}
+		// A format change (jpg↔png) would otherwise leave the old
+		// extension's file shadowing the new one in lookup fallbacks.
+		other := ".png"
+		if coverExt == ".png" {
+			other = ".jpg"
+		}
+		os.Remove(filepath.Join(s.coverDir, id+other))
 	}
 
 	// Compute (or fetch cached) SHA-256 + size. Every book needs this — not
@@ -942,7 +1036,11 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/feed-preferences", localOnly(s.handleFeedPreferences))
 	s.mux.HandleFunc("/", s.tunnelAuth(s.handleDashboard))
 	s.mux.HandleFunc("/settings", localOnly(s.handleSettingsPage))
-	s.mux.HandleFunc("/api/catalog", localOnly(s.handleCatalog))
+	// Catalog is readable over the tunnel (same Basic-auth gate as the
+	// dashboard page, which fetches it for the book grid — it 403'd for
+	// remote viewers when this was localOnly). handleCatalog strips local
+	// file paths from tunnel responses.
+	s.mux.HandleFunc("/api/catalog", s.tunnelAuth(s.handleCatalog))
 	s.mux.HandleFunc("/api/status", localOnly(s.handleStatus))
 	s.mux.HandleFunc("/api/shutdown", localOnly(s.handleShutdown))
 	s.mux.HandleFunc("/api/setup", localOnly(s.handleSetup))
@@ -1633,7 +1731,7 @@ func (s *Server) handleSetup(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var req struct {
-		LibraryPath   string `json:"library_path"`
+		LibraryPath string `json:"library_path"`
 		// Pointer: nil (field omitted) keeps the saved path, "" is an
 		// explicit clear. Guards the configured folder against clients
 		// that save the form without this field.
@@ -2468,10 +2566,16 @@ func (s *Server) handleCatalog(w http.ResponseWriter, r *http.Request) {
 	defer s.mu.RUnlock()
 	w.Header().Set("Content-Type", "application/json")
 
+	viaTunnel := r.Header.Get("X-Mayberry-Via-Tunnel") != ""
 	pageStr := r.URL.Query().Get("page")
 	if pageStr == "" {
-		json.NewEncoder(w).Encode(s.catalog)
-		return
+		// The unpaged full dump (with local file paths) stays local-only;
+		// remote viewers get page 0 of the path-stripped form instead.
+		if !viaTunnel {
+			json.NewEncoder(w).Encode(s.catalog)
+			return
+		}
+		pageStr = "0"
 	}
 
 	const catalogPageSize = 100
@@ -2489,8 +2593,18 @@ func (s *Server) handleCatalog(w http.ResponseWriter, r *http.Request) {
 	if end > total {
 		end = total
 	}
+	books := s.catalog[start:end]
+	if viaTunnel {
+		// Never leak the owner's filesystem layout through the tunnel.
+		stripped := make([]CatalogEntry, len(books))
+		for i, b := range books {
+			b.Path = ""
+			stripped[i] = b
+		}
+		books = stripped
+	}
 	json.NewEncoder(w).Encode(map[string]any{
-		"books": s.catalog[start:end],
+		"books": books,
 		"total": total,
 		"page":  page,
 		"pages": pages,
