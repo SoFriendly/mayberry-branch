@@ -162,9 +162,10 @@ func plural(n int) string {
 	return "s"
 }
 
-// handleOPDSSearch filters the catalog by a case-insensitive substring of
-// title or author (OpenSearch q parameter, or the OPDS 2.0 search
-// template's query parameter).
+// handleOPDSSearch filters the catalog by the search query: every word must
+// match title or author, case-insensitively and ignoring spaces, so
+// "nightvale" finds "Night Vale" (OpenSearch q parameter, or the OPDS 2.0
+// search template's query parameter).
 func (s *Server) handleOPDSSearch(w http.ResponseWriter, r *http.Request) {
 	q := strings.TrimSpace(r.URL.Query().Get("q"))
 	if q == "" {
@@ -199,9 +200,9 @@ func (s *Server) opdsPage(r *http.Request, query string) (entries []opds.Entry, 
 
 	s.mu.RLock()
 	cat := make([]CatalogEntry, 0, len(s.catalog))
-	q := strings.ToLower(query)
+	match := opds.QueryMatcher(query)
 	for _, e := range s.catalog {
-		if q == "" || strings.Contains(strings.ToLower(e.Title), q) || strings.Contains(strings.ToLower(e.Author), q) {
+		if query == "" || match(e.Title, e.Author) {
 			cat = append(cat, e)
 		}
 	}
