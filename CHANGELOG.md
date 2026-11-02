@@ -2,6 +2,11 @@
 
 All notable changes to the Mayberry branch client and network.
 
+## v0.8.32 — 2026-11-01
+
+### Security
+- Hardening against CVE-2026-98432 (Linux kernel TCP use-after-free): on Linux, your branch's local server now uses plain TCP instead of Multipath TCP, removing the setup the published exploit relies on. No functional changes. This doesn't fix the kernel bug itself — Linux users should still install their distribution's kernel update and reboot. macOS and Windows aren't affected.
+
 ## v0.8.31 — 2026-10-25
 
 ### Improved
