@@ -1,0 +1,64 @@
+name: mayberry-branch
+services:
+  mayberry:
+    build:
+      # Context is the repo root (the Go source lives here); the Dockerfile path is
+      # resolved relative to that context, not to this file.
+      context: .
+      dockerfile: docker/Dockerfile
+    image: mayberry-branch:latest
+    container_name: mayberry-branch
+    restart: unless-stopped
+    ports:
+      # Host-side port only. The container always listens on 1950 internally.
+      - "${MAYBERRY_PORT:-1950}:1950"
+    environment:
+      # Required. Your branch's public display name, which is also sanitized into
+      # your public URL: https://<name>.branch.pub
+      MAYBERRY_NAME: "${MAYBERRY_NAME:?set MAYBERRY_NAME to your branch display name}"
+
+      # The scanned library root. Your books are mounted read-only beneath it at
+      # /library/books; the scan is recursive, so they are found there.
+      MAYBERRY_LIBRARY: /library
+
+      MAYBERRY_SERVER: ${MAYBERRY_SERVER:-https://mayberry.pub}
+      MAYBERRY_HUB: ${MAYBERRY_HUB:-https://branch.pub}
+
+      # Network mirror: opt-in failover mirroring of other branches. See docker/README.md.
+      # Turning this on also requires uncommenting the /library/_mirror volume below.
+      MAYBERRY_MIRROR_NETWORK: ${MAYBERRY_MIRROR_NETWORK:-false}
+      MAYBERRY_MIRROR_SIZE: ${MAYBERRY_MIRROR_SIZE:-100G}
+      MAYBERRY_MIRROR_ONLY: ${MAYBERRY_MIRROR_ONLY:-}
+      MAYBERRY_MIRROR_IGNORE: ${MAYBERRY_MIRROR_IGNORE:-}
+      MAYBERRY_MIRROR_RATE: ${MAYBERRY_MIRROR_RATE:-slow}
+      MAYBERRY_MIRROR_SERVE_RATE: ${MAYBERRY_MIRROR_SERVE_RATE:-200K}
+    volumes:
+      # Required. Your EPUB folder, scanned recursively. Mounted read-only, and
+      # beneath the library root rather than at it, so that the mirror below gets
+      # its own mount and nothing is ever created inside your library folder.
+      - "${MAYBERRY_LIBRARY_PATH:?set MAYBERRY_LIBRARY_PATH to your EPUB folder}:/library/books:ro"
+
+      # Only needed when MAYBERRY_MIRROR_NETWORK is true. Mayberry hardcodes the
+      # mirror location to <library>/_mirror (internal/mirror/paths.go), so it has
+      # to be mounted at that exact path -- but on the host it lands wherever
+      # MAYBERRY_MIRROR_PATH points, well outside your library. Expect it to grow
+      # to MAYBERRY_MIRROR_SIZE.
+      # - "${MAYBERRY_MIRROR_PATH:-./data/mirror}:/library/_mirror"
+
+      # Branch identity (branch_id, friendly_id) and cached cover images. Persists
+      # across restarts and image upgrades.
+      - mayberry-data:/home/mayberry/.mayberry
+
+    # Only needed if your library is not world-readable (it is mounted read-only,
+    # so any uid can read a normal 0755 tree). If you do need to match the host
+    # owner, override the uid but KEEP THE GID AT 1000: the mayberry-data volume
+    # is seeded from the image owned by gid 1000, and the daemon has to be able to
+    # write branch.json there or it regenerates its identity on every restart.
+    # e.g. `user: "1001:1000"`.
+    # user: "1000:1000"
+
+volumes:
+  mayberry-data:
+
+# Audiobook libraries are not supported by this image. audiobook_path is the only
+# setting upstream exposes no CLI flag for; see docker/docker-entrypoint.sh for details.

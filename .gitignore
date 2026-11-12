@@ -10,6 +10,9 @@ Thumbs.db
 # Config (may contain local paths)
 .claude/
 
+# Docker
+.env
+data/
 # Private audit artifacts
 SECURITY_AUDIT*.md
 security_audit_test.go
