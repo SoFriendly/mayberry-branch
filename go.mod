@@ -1,6 +1,10 @@
 module github.com/sofriendly/mayberry
 
-go 1.23
+go 1.26.8
+
+// Plain TCP listeners: Go 1.24+ defaults them to MPTCP, the precondition
+// for the CVE-2026-98432 exploit. Nothing here uses multipath.
+godebug multipathtcp=0
 
 require (
 	github.com/charmbracelet/bubbletea v1.3.4

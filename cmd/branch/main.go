@@ -24,6 +24,7 @@ import (
 
 	"github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/sofriendly/mayberry/internal/auth"
 	"github.com/sofriendly/mayberry/internal/branchhttp"
 	"github.com/sofriendly/mayberry/internal/config"
 	"github.com/sofriendly/mayberry/internal/friendlyid"
@@ -127,13 +128,13 @@ func (s *sharedState) getCounts() (int, int) {
 // ---------------------------------------------------------------------------
 
 type model struct {
-	cfg          *config.BranchConfig
-	setupDone    chan struct{} // closed when web setup completes
-	step         int          // 0=welcome, 1=waiting
-	dotCount     int
-	width        int
-	height       int
-	quitting     bool
+	cfg       *config.BranchConfig
+	setupDone chan struct{} // closed when web setup completes
+	step      int           // 0=welcome, 1=waiting
+	dotCount  int
+	width     int
+	height    int
+	quitting  bool
 }
 
 func initialModel(cfg *config.BranchConfig, setupDone chan struct{}) model {
@@ -144,7 +145,6 @@ func initialModel(cfg *config.BranchConfig, setupDone chan struct{}) model {
 		height:    24,
 	}
 }
-
 
 func tickCmd() tea.Cmd {
 	return tea.Tick(500*time.Millisecond, func(t time.Time) tea.Msg {
@@ -352,8 +352,8 @@ func startBackgroundServices(ctx context.Context, cfg *config.BranchConfig, hubU
 func startFullServices(ctx context.Context, cfg *config.BranchConfig, hubURL string, state *sharedState, alog *activityLog, branchSrv *branchhttp.Server, swap *handlerSwap) {
 	// Register with Town Square
 	alog.Add("Registering with Town Square...")
-	branchID := register(cfg)
-	if branchID != "" {
+	branchID, registered := registerOrRetainIdentity(cfg)
+	if registered {
 		branchSrv = branchhttp.NewServer(branchID, cfg.LibraryPath)
 		branchSrv.SetConfig(cfg)
 		branchSrv.SetVersion(Version)
@@ -364,13 +364,15 @@ func startFullServices(ctx context.Context, cfg *config.BranchConfig, hubURL str
 			cfg.AudiobookPath = updated.AudiobookPath
 			cfg.DisplayName = updated.DisplayName
 			cfg.Subdomain = updated.Subdomain
+			cfg.SharedUsers = updated.SharedUsers
 		})
 		swap.Set(branchSrv)
 		state.setStatus("townsquare", "connected")
 		alog.Add(fmt.Sprintf("Registered with Town Square (id: %s)", branchID))
 	} else {
 		state.setStatus("townsquare", "error")
-		alog.Add("Town Square registration failed")
+		alog.Add("Town Square registration failed — retaining saved branch identity")
+		branchSrv.SetBranchID(branchID)
 	}
 
 	// Restart callback is local-only — it doesn't need branchID or a
@@ -429,13 +431,38 @@ func startFullServices(ctx context.Context, cfg *config.BranchConfig, hubURL str
 			if pending == nil {
 				continue
 			}
-			if err := syncBooks(cfg.ServerURL, branchID, branchSrv.CoverDir(), pending); err != nil {
+			orphans, err := syncBooks(cfg.ServerURL, branchID, branchSrv.CoverDir(), pending, cfg.SharedUsers, cfg.BranchCredential)
+			if err != nil {
 				log.Printf("branch: sync: %v (retrying in 1m)", err)
 				alog.Add("Sync to Town Square failed — retrying in 1 minute")
 				retry = time.After(time.Minute)
 				continue
 			}
 			alog.Add(fmt.Sprintf("Synced %d title(s) to Town Square", len(pending)))
+			// Delete mirror files for books the catalog no longer knows —
+			// they can never be listed or downloaded again. Removal
+			// triggers a rescan (watch dir changed), which drops them
+			// from the next sync's payload.
+			if n := branchSrv.RemoveMirrorOrphans(orphans); n > 0 {
+				log.Printf("branch: removed %d orphaned mirror file(s)", n)
+				alog.Add(fmt.Sprintf("Removed %d orphaned mirror file(s) no longer in the catalog", n))
+			}
+			// Re-upload covers whose embedded image changed since Town
+			// Square first stored them. Marked entries survive a failed
+			// attempt and retry on the next sync.
+			if dirty := branchSrv.DirtyCovers(); len(dirty) > 0 {
+				refreshed := 0
+				for _, id := range dirty {
+					if uploadCover(cfg.ServerURL, branchID, branchSrv.CoverDir(), id, cfg.BranchCredential, true) {
+						branchSrv.ClearDirtyCover(id)
+						refreshed++
+					}
+				}
+				if refreshed > 0 {
+					log.Printf("branch: refreshed %d changed cover(s) on Town Square", refreshed)
+					alog.Add(fmt.Sprintf("Refreshed %d changed cover(s) on Town Square", refreshed))
+				}
+			}
 			pending = nil
 		}
 	}()
@@ -449,7 +476,21 @@ func startFullServices(ctx context.Context, cfg *config.BranchConfig, hubURL str
 			queueSync(books)
 		}
 	}
-	watcher := storage.NewMultiWatcher(watchDirs, 30*time.Second, scanAndSync)
+	// Surfaces walk errors (unmounted drive, permission denied, etc.) on the
+	// dashboard every scan so a stale/empty catalog isn't silent. The
+	// activity log only gets an entry on transition (problem starts/clears)
+	// so a persisting issue doesn't spam it every 30s.
+	scanHadErrors := false
+	onScanError := func(errs []string) {
+		branchSrv.SetScanWarnings(errs)
+		if len(errs) > 0 && !scanHadErrors {
+			alog.Add(fmt.Sprintf("Library scan warning: %d issue(s) — see dashboard for details", len(errs)))
+		} else if len(errs) == 0 && scanHadErrors {
+			alog.Add("Library scan issues resolved")
+		}
+		scanHadErrors = len(errs) > 0
+	}
+	watcher := storage.NewMultiWatcher(watchDirs, 30*time.Second, scanAndSync, onScanError)
 	watcher.Start()
 
 	// /api/sync triggers a fresh scan that ignores the watcher's change-tracking.
@@ -473,7 +514,7 @@ func startFullServices(ctx context.Context, cfg *config.BranchConfig, hubURL str
 	// refreshTunnelToken fetches a fresh token. On 403 it re-registers (in case
 	// our saved branch_id was orphaned in the DB) and tries once more.
 	refreshTunnelToken := func() string {
-		token, status := fetchTunnelToken(cfg.ServerURL, branchID, cfg.Subdomain)
+		token, status := fetchTunnelToken(cfg.ServerURL, branchID, cfg.Subdomain, cfg.BranchCredential)
 		if token != "" {
 			return token
 		}
@@ -482,7 +523,8 @@ func startFullServices(ctx context.Context, cfg *config.BranchConfig, hubURL str
 			alog.Add("Re-registering with Town Square (stale branch id)")
 			if newID := register(cfg); newID != "" {
 				branchID = newID
-				token, _ = fetchTunnelToken(cfg.ServerURL, branchID, cfg.Subdomain)
+				branchSrv.SetBranchID(newID)
+				token, _ = fetchTunnelToken(cfg.ServerURL, branchID, cfg.Subdomain, cfg.BranchCredential)
 				return token
 			}
 		}
@@ -515,7 +557,7 @@ func startFullServices(ctx context.Context, cfg *config.BranchConfig, hubURL str
 	if branchID != "" {
 		go func() {
 			alog.Add("Heartbeat started (5m interval)")
-			heartbeatLoop(ctx, cfg.ServerURL, branchID, alog)
+			heartbeatLoop(ctx, cfg.ServerURL, branchID, cfg.BranchCredential, alog)
 		}()
 	}
 
@@ -532,6 +574,7 @@ func startFullServices(ctx context.Context, cfg *config.BranchConfig, hubURL str
 		branchSrv.SetMirrorServeCallback(mgr.OnServe)
 		branchSrv.SetMirrorStatsFn(mgr.Stats)
 		branchSrv.SetMirrorPurgeFn(mgr.Purge)
+		branchSrv.SetMirrorOrphanFn(mgr.RemoveOrphans)
 		mgr.Start(ctx)
 	}
 
@@ -550,33 +593,66 @@ func startFullServices(ctx context.Context, cfg *config.BranchConfig, hubURL str
 // httpClient is used for all Town Square API calls.
 var httpClient = &http.Client{Timeout: 15 * time.Second}
 
+// A timeout must not replace the saved identity with an empty runtime ID.
+func registerOrRetainIdentity(cfg *config.BranchConfig) (string, bool) {
+	if id := register(cfg); id != "" {
+		return id, true
+	}
+	return cfg.BranchID, false
+}
+
 func register(cfg *config.BranchConfig) string {
+	if err := config.EnsureBranchCredential(cfg); err != nil {
+		log.Printf("branch: credential setup failed: %v", err)
+		return ""
+	}
 	body, err := json.Marshal(map[string]string{
-		"branch_id":    cfg.BranchID,
-		"display_name": cfg.DisplayName,
-		"subdomain":    cfg.Subdomain,
-		"tunnel_id":    cfg.Subdomain,
+		"branch_id":       cfg.BranchID,
+		"enrollment_card": cfg.UserID,
+		"display_name":    cfg.DisplayName,
+		"subdomain":       cfg.Subdomain,
+		"tunnel_id":       cfg.Subdomain,
 	})
 	if err != nil {
 		log.Printf("branch: register marshal: %v", err)
 		return ""
 	}
-	resp, err := httpClient.Post(cfg.ServerURL+"/api/branches/register", "application/json", bytes.NewReader(body))
+	resp, err := auth.BranchPost(httpClient, cfg.ServerURL+"/api/branches/register", cfg.BranchCredential, bytes.NewReader(body))
 	if err != nil {
 		log.Printf("branch: register: %v", err)
 		return ""
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("branch: registration rejected: HTTP %d", resp.StatusCode)
+		return ""
+	}
+	if resp.Header.Get("X-Mayberry-Branch-Auth") == "legacy" {
+		log.Printf("branch: existing identity retained; ownership enrollment pending")
+	}
+
 	var result struct {
 		BranchID string `json:"branch_id"`
+		UserID   string `json:"user_id"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		log.Printf("branch: register decode: %v", err)
 		return ""
 	}
+	changed := false
 	if result.BranchID != "" && result.BranchID != cfg.BranchID {
 		cfg.BranchID = result.BranchID
+		changed = true
+	}
+	// The user ID is assigned exactly once by Town Square; persist it the
+	// first time we see it and never overwrite an existing one.
+	if result.UserID != "" && cfg.UserID == "" {
+		cfg.UserID = result.UserID
+		changed = true
+		log.Printf("branch: library card saved")
+	}
+	if changed {
 		if err := config.SaveBranch(cfg); err != nil {
 			log.Printf("branch: save config: %v", err)
 		}
@@ -588,12 +664,12 @@ func register(cfg *config.BranchConfig) string {
 // Returns the token and the HTTP status code. Empty token + status 403
 // means Town Square doesn't recognize our (branch_id, subdomain) and we
 // should re-register before retrying.
-func fetchTunnelToken(serverURL, branchID, subdomain string) (string, int) {
+func fetchTunnelToken(serverURL, branchID, subdomain, credential string) (string, int) {
 	body, _ := json.Marshal(map[string]string{
 		"branch_id": branchID,
 		"subdomain": subdomain,
 	})
-	resp, err := httpClient.Post(serverURL+"/api/tunnel/token", "application/json", bytes.NewReader(body))
+	resp, err := auth.BranchPost(httpClient, serverURL+"/api/tunnel/token", credential, bytes.NewReader(body))
 	if err != nil {
 		log.Printf("branch: tunnel token: %v", err)
 		return "", 0
@@ -622,50 +698,62 @@ func fetchTunnelToken(serverURL, branchID, subdomain string) (string, int) {
 // holdings race) happened.
 var syncClient = &http.Client{Timeout: 2 * time.Minute}
 
-// syncBooks pushes the full catalog to Town Square. A non-nil return
+// syncBooks pushes the full catalog to Town Square. A non-nil error
 // means the catalog may not have landed and the caller should retry.
-func syncBooks(serverURL, branchID, coverDir string, books []branchhttp.BookMeta) error {
+// Returns the book IDs the server reported as orphaned mirror copies
+// (no longer in the catalog) so the caller can delete the dead files.
+// sharedUsers rides along on every sync so allowlist edits in settings
+// propagate within one scan interval; it must be non-nil (an empty list
+// marshals to [] — a JSON null would make Town Square skip the update).
+func syncBooks(serverURL, branchID, coverDir string, books []branchhttp.BookMeta, sharedUsers []string, credential string) ([]string, error) {
+	if sharedUsers == nil {
+		sharedUsers = []string{}
+	}
 	body, err := json.Marshal(map[string]any{
-		"branch_id": branchID,
-		"books":     books,
+		"branch_id":       branchID,
+		"books":           books,
+		"shared_user_ids": sharedUsers,
 	})
 	if err != nil {
-		return fmt.Errorf("marshal: %w", err)
+		return nil, fmt.Errorf("marshal: %w", err)
 	}
-	resp, err := syncClient.Post(serverURL+"/api/branches/sync", "application/json", bytes.NewReader(body))
+	resp, err := auth.BranchPost(syncClient, serverURL+"/api/branches/sync", credential, bytes.NewReader(body))
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("server returned %s", resp.Status)
+		return nil, fmt.Errorf("server returned %s", resp.Status)
 	}
 
 	var result struct {
-		Status      string   `json:"status"`
-		NeedsCovers []string `json:"needs_covers"`
+		Status          string   `json:"status"`
+		NeedsCovers     []string `json:"needs_covers"`
+		OrphanedMirrors []string `json:"orphaned_mirrors"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		return nil // sync landed; cover hints are best-effort
+		return nil, nil // sync landed; cover and orphan hints are best-effort
 	}
 	if coverDir == "" || len(result.NeedsCovers) == 0 {
-		return nil
+		return result.OrphanedMirrors, nil
 	}
 	uploaded := 0
 	for _, isbn := range result.NeedsCovers {
-		if uploadCover(serverURL, branchID, coverDir, isbn) {
+		if uploadCover(serverURL, branchID, coverDir, isbn, credential, false) {
 			uploaded++
 		}
 	}
 	if uploaded > 0 {
 		log.Printf("branch: uploaded %d cover(s) to Town Square", uploaded)
 	}
-	return nil
+	return result.OrphanedMirrors, nil
 }
 
 // uploadCover sends a single cover image to Town Square. Returns true on
-// successful upload (or if no local file exists, which is silent).
-func uploadCover(serverURL, branchID, coverDir, isbn string) bool {
+// successful upload (or if no local file exists, which is silent). refresh
+// asks the server to replace an existing cover — used when the local file's
+// embedded cover changed; otherwise the server keeps the first cover it saw.
+func uploadCover(serverURL, branchID, coverDir, isbn, credential string, refresh bool) bool {
 	ext := ".jpg"
 	path := filepath.Join(coverDir, isbn+ext)
 	data, err := os.ReadFile(path)
@@ -683,11 +771,12 @@ func uploadCover(serverURL, branchID, coverDir, isbn string) bool {
 		"isbn":      isbn,
 		"cover_b64": base64.StdEncoding.EncodeToString(data),
 		"ext":       ext,
+		"refresh":   refresh,
 	})
 	if err != nil {
 		return false
 	}
-	resp, err := httpClient.Post(serverURL+"/api/branches/cover", "application/json", bytes.NewReader(body))
+	resp, err := auth.BranchPost(httpClient, serverURL+"/api/branches/cover", credential, bytes.NewReader(body))
 	if err != nil {
 		log.Printf("branch: cover upload %s: %v", isbn, err)
 		return false
@@ -698,7 +787,7 @@ func uploadCover(serverURL, branchID, coverDir, isbn string) bool {
 
 const heartbeatInterval = 5 * time.Minute
 
-func heartbeatLoop(ctx context.Context, serverURL, branchID string, alog *activityLog) {
+func heartbeatLoop(ctx context.Context, serverURL, branchID, credential string, alog *activityLog) {
 	ticker := time.NewTicker(heartbeatInterval)
 	defer ticker.Stop()
 	for {
@@ -711,7 +800,7 @@ func heartbeatLoop(ctx context.Context, serverURL, branchID string, alog *activi
 				alog.Add("Heartbeat marshal error: " + err.Error())
 				continue
 			}
-			resp, err := httpClient.Post(serverURL+"/api/branches/heartbeat", "application/json", bytes.NewReader(body))
+			resp, err := auth.BranchPost(httpClient, serverURL+"/api/branches/heartbeat", credential, bytes.NewReader(body))
 			if err != nil {
 				alog.Add("Heartbeat failed: " + err.Error())
 				continue
@@ -1012,11 +1101,15 @@ func spawnDetachedDaemon() error {
 func printStatus(cfg *config.BranchConfig) {
 	fmt.Printf("  ✓ Branch is running.\n")
 	fmt.Println()
-	fmt.Printf("  Your EPUBs are now discoverable on the Mayberry network.\n")
-	fmt.Printf("  Anyone can browse and download from your branch at:\n")
+	fmt.Printf("  Your branch is private. Share it by giving friends your user ID;\n")
+	fmt.Printf("  people you've added can browse and download at:\n")
 	fmt.Println()
 	fmt.Printf("    https://%s.branch.pub\n", cfg.Subdomain)
 	fmt.Println()
+	if cfg.UserID != "" {
+		fmt.Printf("  Your user ID: %s  (catalog sign-in: use it as username AND password)\n", cfg.UserID)
+		fmt.Println()
+	}
 	fmt.Printf("  Manage your branch:\n")
 	fmt.Printf("    Dashboard:  http://localhost:%d\n", cfg.Port)
 	fmt.Printf("    Settings:   http://localhost:%d/settings\n", cfg.Port)
@@ -1065,7 +1158,9 @@ func performAutoUpdate(alog *activityLog) bool {
 	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
 		return false
 	}
-	if info.Version == "" || info.Version == "unknown" || info.Version == Version {
+	// Strictly newer only — never sideways or back. A compromised server
+	// re-serving an older signed release can't roll clients back.
+	if !isNewerVersion(info.Version, Version) {
 		return false
 	}
 
@@ -1076,9 +1171,17 @@ func performAutoUpdate(alog *activityLog) bool {
 	if runtime.GOOS == "windows" {
 		ext = ".exe"
 	}
-	url := fmt.Sprintf("%s/releases/mayberry-%s-%s%s", config.DefaultServerURL, runtime.GOOS, runtime.GOARCH, ext)
+	name := fmt.Sprintf("mayberry-%s-%s%s", runtime.GOOS, runtime.GOARCH, ext)
+	url := config.DefaultServerURL + "/releases/" + name
 
 	dlClient := &http.Client{Timeout: 5 * time.Minute}
+	sig, err := fetchReleaseSignature(dlClient, url)
+	if err != nil {
+		// Fail closed: an unsigned release never installs.
+		log.Printf("auto-update: no release signature: %v", err)
+		alog.Add(fmt.Sprintf("Auto-update skipped: release %s has no valid signature", info.Version))
+		return false
+	}
 	dlResp, err := dlClient.Get(url)
 	if err != nil {
 		log.Printf("auto-update: download failed: %v", err)
@@ -1100,6 +1203,9 @@ func performAutoUpdate(alog *activityLog) bool {
 	execPath, _ = filepath.EvalSymlinks(execPath)
 
 	tmpPath := execPath + ".update"
+	if runtime.GOOS == "windows" {
+		tmpPath += ".exe"
+	}
 	tmp, err := os.Create(tmpPath)
 	if err != nil {
 		// Common failure: binary directory is root-owned but daemon runs
@@ -1119,13 +1225,23 @@ func performAutoUpdate(alog *activityLog) bool {
 	tmp.Close()
 	os.Chmod(tmpPath, 0755)
 
-	// Swap the binary.
-	if runtime.GOOS == "windows" {
-		oldPath := execPath + ".old"
-		os.Remove(oldPath)
-		os.Rename(execPath, oldPath)
+	// Verify BEFORE checkUpdateExecutable — that check executes the
+	// downloaded binary, which must never happen unverified.
+	if err := verifyReleaseSignature(tmpPath, name, info.Version, sig); err != nil {
+		os.Remove(tmpPath)
+		log.Printf("auto-update: %v — refusing to install", err)
+		alog.Add(fmt.Sprintf("Auto-update refused: release %s failed signature verification", info.Version))
+		return false
 	}
-	if err := os.Rename(tmpPath, execPath); err != nil {
+
+	if err := checkUpdateExecutable(tmpPath, info.Version); err != nil {
+		os.Remove(tmpPath)
+		log.Printf("auto-update: keeping current executable: %v", err)
+		alog.Add("Update cannot run on this system; keeping the current version")
+		return false
+	}
+
+	if err := replaceExecutable(execPath, tmpPath, runtime.GOOS == "windows"); err != nil {
 		os.Remove(tmpPath)
 		// Same root cause as the os.Create EACCES above — without this log
 		// the user sees the daemon happily reconnecting every 15 minutes and
@@ -1327,7 +1443,7 @@ func handleUpdate() {
 		return
 	}
 
-	if info.Version == Version {
+	if !isNewerVersion(info.Version, Version) {
 		fmt.Printf("Already up to date (version %s).\n", Version)
 		return
 	}
@@ -1335,18 +1451,28 @@ func handleUpdate() {
 	fmt.Printf("Update available: %s -> %s\n", Version, info.Version)
 
 	// Download the new binary.
-	goos := runtime.GOOS
-	goarch := runtime.GOARCH
 	ext := ""
-	if goos == "windows" {
+	if runtime.GOOS == "windows" {
 		ext = ".exe"
 	}
-	url := fmt.Sprintf("%s/releases/mayberry-%s-%s%s", serverURL, goos, goarch, ext)
+	name := fmt.Sprintf("mayberry-%s-%s%s", runtime.GOOS, runtime.GOARCH, ext)
+	url := serverURL + "/releases/" + name
+
+	sig, err := fetchReleaseSignature(httpClient, url)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Release %s has no valid signature (%v) — refusing to install.\n", info.Version, err)
+		os.Exit(1)
+	}
 
 	fmt.Printf("Downloading from %s...\n", url)
 	dlResp, err := httpClient.Get(url)
-	if err != nil || dlResp.StatusCode != 200 {
-		fmt.Fprintf(os.Stderr, "Download failed (status %d): %v\n", dlResp.StatusCode, err)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Download failed: %v\n", err)
+		return
+	}
+	if dlResp.StatusCode != 200 {
+		dlResp.Body.Close()
+		fmt.Fprintf(os.Stderr, "Download failed (status %d)\n", dlResp.StatusCode)
 		os.Exit(1)
 	}
 	defer dlResp.Body.Close()
@@ -1360,6 +1486,9 @@ func handleUpdate() {
 	execPath, _ = filepath.EvalSymlinks(execPath)
 
 	tmpPath := execPath + ".update"
+	if runtime.GOOS == "windows" {
+		tmpPath += ".exe"
+	}
 	tmp, err := os.Create(tmpPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Cannot create temp file: %v\n", err)
@@ -1375,17 +1504,21 @@ func handleUpdate() {
 	tmp.Close()
 	os.Chmod(tmpPath, 0755)
 
-	// Swap the binary. On Windows, rename the old one out of the way first.
-	if runtime.GOOS == "windows" {
-		oldPath := execPath + ".old"
-		os.Remove(oldPath)
-		if err := os.Rename(execPath, oldPath); err != nil {
-			os.Remove(tmpPath)
-			fmt.Fprintf(os.Stderr, "Failed to replace binary: %v\n", err)
-			os.Exit(1)
-		}
+	// Verify BEFORE checkUpdateExecutable — that check executes the
+	// downloaded binary, which must never happen unverified.
+	if err := verifyReleaseSignature(tmpPath, name, info.Version, sig); err != nil {
+		os.Remove(tmpPath)
+		fmt.Fprintf(os.Stderr, "Release failed signature verification (%v) — refusing to install.\n", err)
+		os.Exit(1)
 	}
-	if err := os.Rename(tmpPath, execPath); err != nil {
+
+	if err := checkUpdateExecutable(tmpPath, info.Version); err != nil {
+		os.Remove(tmpPath)
+		fmt.Fprintf(os.Stderr, "Keeping the current executable: %v\n", err)
+		return
+	}
+
+	if err := replaceExecutable(execPath, tmpPath, runtime.GOOS == "windows"); err != nil {
 		os.Remove(tmpPath)
 		fmt.Fprintf(os.Stderr, "Failed to replace binary: %v\n", err)
 		os.Exit(1)
@@ -1451,7 +1584,10 @@ func branchDeregister() error {
 	}
 
 	body, _ := json.Marshal(map[string]string{"branch_id": cfg.BranchID})
-	resp, err := http.Post(cfg.ServerURL+"/api/branches/deregister", "application/json", bytes.NewReader(body))
+	if err := config.EnsureBranchCredential(cfg); err != nil {
+		return err
+	}
+	resp, err := auth.BranchPost(httpClient, cfg.ServerURL+"/api/branches/deregister", cfg.BranchCredential, bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
@@ -1472,8 +1608,8 @@ func branchDeregister() error {
 // ---------------------------------------------------------------------------
 
 const (
-	macLabel    = "com.sofriendly.mayberry"
-	linuxUnit   = "mayberry-branch.service"
+	macLabel  = "com.sofriendly.mayberry"
+	linuxUnit = "mayberry-branch.service"
 )
 
 func macPlistPath() string {
@@ -1652,4 +1788,3 @@ func uninstallSystemdUnit() error {
 	fmt.Printf("Service uninstalled: %s\n", upath)
 	return nil
 }
-

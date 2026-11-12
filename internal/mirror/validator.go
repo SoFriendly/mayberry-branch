@@ -45,14 +45,25 @@ func (k Kind) Ext() string {
 // therefore an EPUB, which is just a zip with specific contents).
 var zipMagic = []byte{0x50, 0x4B, 0x03, 0x04}
 
+// m4bBrands are the ISO-BMFF major brands (bytes 8:12 of an mp4 file's
+// ftyp box) we accept as an audiobook. Audible/most encoders stamp M4A or
+// M4B; many general encoders use isom/mp42/mp41/iso2, so we accept those
+// too and rely on validateM4B to confirm the container is well-formed.
+var m4bBrands = map[string]bool{
+	"M4A ": true, "M4B ": true, "mp42": true,
+	"mp41": true, "isom": true, "iso2": true,
+}
+
+// ftypMagic is the box type at offset 4 of an ISO base media file.
+var ftypMagic = []byte("ftyp")
+
 // SniffKind reads enough of path to identify the file format by magic
 // bytes alone. We do NOT trust any advertised extension or MIME type
 // from the source — bytes are the only authority.
 //
-// Today this recognizes EPUB. M4B detection (`ftyp` atom at offset 4
-// with major brand in {M4A, M4B, mp42, isom}) lands when the M4B
-// validator does; for now M4B-shaped files sniff as Unknown and get
-// rejected.
+// Recognizes EPUB (zip magic) and M4B (an ISO-BMFF `ftyp` box at offset 4
+// carrying an audio major brand). Everything else sniffs as Unknown and
+// is rejected; validateM4B then confirms the container structure.
 func SniffKind(path string) (Kind, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -70,6 +81,9 @@ func SniffKind(path string) (Kind, error) {
 	}
 	if bytes.Equal(head[0:4], zipMagic) {
 		return KindEPUB, nil
+	}
+	if n >= 12 && bytes.Equal(head[4:8], ftypMagic) && m4bBrands[string(head[8:12])] {
+		return KindM4B, nil
 	}
 	return KindUnknown, nil
 }
@@ -94,7 +108,7 @@ func Validate(path string, kind Kind, maxBytes int64) error {
 	case KindEPUB:
 		return validateEPUB(path, maxBytes)
 	case KindM4B:
-		return &ValidationError{Reason: "m4b validation not yet enabled"}
+		return validateM4B(path, maxBytes)
 	}
 	return &ValidationError{Reason: "unknown file kind"}
 }

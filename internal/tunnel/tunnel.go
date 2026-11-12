@@ -69,8 +69,9 @@ func (c *Client) buildWSURL() string {
 	wsURL := strings.Replace(c.hubURL, "https://", "wss://", 1)
 	wsURL = strings.Replace(wsURL, "http://", "ws://", 1)
 	params := url.Values{
-		"subdomain": {c.subdomain},
-		"port":      {fmt.Sprintf("%d", c.localPort)},
+		"subdomain":     {c.subdomain},
+		"port":          {fmt.Sprintf("%d", c.localPort)},
+		"response_mode": {"chunked"},
 	}
 	if c.token != "" {
 		params.Set("token", c.token)
@@ -97,6 +98,7 @@ func (c *Client) Connect(ctx context.Context) error {
 		return nil
 	}
 
+	conn.SetReadLimit(16 << 20) // 10 MB request body after base64 plus headers
 	c.conn = conn
 	log.Printf("tunnel: WebSocket connected as %s.branch.pub", c.subdomain)
 
@@ -143,7 +145,8 @@ func (c *Client) readLoop(ctx context.Context, wsURL string) {
 	localBase := fmt.Sprintf("http://127.0.0.1:%d", c.localPort)
 	// No timeout: large downloads to slow clients can take many minutes,
 	// and TCP backpressure blocks the local body read.
-	localClient := &http.Client{}
+	localClient := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	slots := make(chan struct{}, 64)
 
 	for {
 		select {
@@ -162,7 +165,12 @@ func (c *Client) readLoop(ctx context.Context, wsURL string) {
 		}
 
 		// Forward the request to the local Branch HTTP server.
-		go c.forwardToLocal(localClient, localBase, req)
+		select {
+		case slots <- struct{}{}:
+			go func(req tunnelRequest) { defer func() { <-slots }(); c.forwardToLocal(localClient, localBase, req) }(req)
+		default:
+			c.sendErrorResponse(req.ID, http.StatusServiceUnavailable, "Branch is busy; retry shortly")
+		}
 	}
 }
 
@@ -282,6 +290,7 @@ func (c *Client) reconnectLoop(ctx context.Context, wsURL string) {
 			continue
 		}
 
+		conn.SetReadLimit(16 << 20) // 10 MB request body after base64 plus headers
 		c.conn = conn
 		log.Printf("tunnel: reconnected as %s.branch.pub", c.subdomain)
 
